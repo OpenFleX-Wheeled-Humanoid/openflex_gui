@@ -121,7 +121,8 @@ class MainWindow(QMainWindow):
         self._proc_bringup: QProcess | None = None
         self._proc_vr: QProcess | None = None
         self._proc_keyboard: QProcess | None = None
-        self._proc_battery: QProcess | None = None
+        self._proc_camera: QProcess | None = None
+        self._proc_lidar: QProcess | None = None
         self._start_sequence_after_can = False
         self._auto_start_vr_pending = False
         self._auto_start_vr_attempts = 0
@@ -221,22 +222,36 @@ class MainWindow(QMainWindow):
         h5.addWidget(self.btn_keyboard_stop)
         root.addWidget(grp_keyboard)
 
-        # --- 6. 电量显示 ---
-        grp_battery = QGroupBox('6. 电量显示 (ros2 launch)')
-        h5 = QHBoxLayout(grp_battery)
-        self.dot_battery = StatusDot()
-        self.btn_battery_start = QPushButton('显示电量')
-        self.btn_battery_start.setMinimumHeight(40)
-        self.btn_battery_start.clicked.connect(self._on_start_battery)
-        self.btn_battery_stop = QPushButton('停止')
-        self.btn_battery_stop.setMinimumHeight(40)
-        self.btn_battery_stop.setFixedWidth(80)
-        self.btn_battery_stop.setEnabled(False)
-        self.btn_battery_stop.clicked.connect(self._on_stop_battery)
-        h5.addWidget(self.dot_battery)
-        h5.addWidget(self.btn_battery_start, 1)
-        h5.addWidget(self.btn_battery_stop)
-        root.addWidget(grp_battery)
+        # --- 6. 传感器检测 (Ultra版) ---
+        grp_sensors = QGroupBox('6. 传感器检测 (Ultra版)')
+        h6 = QHBoxLayout(grp_sensors)
+
+        # 相机查看器按钮
+        self.btn_camera = QPushButton('相机查看器 (RealSense)')
+        self.btn_camera.setMinimumHeight(40)
+        self.btn_camera.clicked.connect(self._on_start_camera_viewer)
+        h6.addWidget(self.btn_camera, 1)
+
+        # 添加分隔线
+        separator = QFrame()
+        separator.setFrameShape(QFrame.VLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        h6.addWidget(separator)
+
+        # 激光雷达查看器按钮和停止按钮
+        self.btn_lidar = QPushButton('激光雷达查看器 (Livox MID360s)')
+        self.btn_lidar.setMinimumHeight(40)
+        self.btn_lidar.clicked.connect(self._on_start_lidar_viewer)
+        h6.addWidget(self.btn_lidar, 1)
+
+        self.btn_lidar_stop = QPushButton('停止')
+        self.btn_lidar_stop.setMinimumHeight(40)
+        self.btn_lidar_stop.setFixedWidth(80)
+        self.btn_lidar_stop.setEnabled(False)
+        self.btn_lidar_stop.clicked.connect(self._on_stop_lidar_viewer)
+        h6.addWidget(self.btn_lidar_stop)
+
+        root.addWidget(grp_sensors)
 
         # --- 日志 ---
         log_label = QLabel('日志输出:')
@@ -417,124 +432,39 @@ class MainWindow(QMainWindow):
     def _check_status_worker(self):
         self._log('=' * 50)
         self._log('检查全部电机状态...')
-        try:
-            import can_utils as cu
-        except ImportError as e:
-            self._log_err(f'无法导入 can_utils: {e}')
+
+        # 使用 check_motor_status.py 脚本（不依赖 openflex_driver 包）
+        script_path = os.path.join(
+            _SRC_DIR, 'openflex_integrated', 'openflex_manager', 'scripts', 'check_motor_status.py'
+        )
+
+        if not os.path.exists(script_path):
+            self._log_err(f'脚本不存在: {script_path}')
             self._call_ui(lambda: self.dot_status.set_state('idle'))
             self._call_ui(lambda: self.btn_status.setEnabled(True))
             return
 
-        all_ok = True
-
-        # --- 升降台 ---
-        self._log('\n【升降台】')
         try:
-            if self._iface_up('can3'):
-                sock = cu.open_can_socket('can3', recv_timeout_s=0.3)
-                ok, sw, state_str = cu.lift_get_status(sock, 16)
-                sock.close()
-                self._log('  CAN: can3  node_id=16')
-                if ok:
-                    self._log(f'    状态: {state_str}  (statusword=0x{sw:04X})')
-                    self._log('  🔴响应[正常]')
-                else:
-                    self._log_err('  无响应')
-                    all_ok = False
-            else:
-                self._log(f'  can3 不可用')
-                all_ok = False
-        except Exception as e:
-            self._log_err(f'  升降台查询异常: {e}')
-            all_ok = False
-
-        # --- RS06 转向 ---
-        self._log('\n【底盘转向 RS06】')
-        try:
-            if self._iface_up('can5'):
-                sock = cu.open_can_socket('can5', recv_timeout_s=0.1)
-                self._log(f'  CAN: can5  电机 id={cu.RS06_MOTOR_IDS}')
-                self._log('  ID    状态       位置(rad)      速度(r/s)      扭矩(Nm)       温度(°C)')
-                self._log('  ------------------------------------------------------------')
-                for mid in cu.RS06_MOTOR_IDS:
-                    ok, pos, vel, trq, tmp = cu.rs06_get_status(sock, mid)
-                    if ok:
-                        self._log(f'  {mid:<5} 🔴响应       {pos:<12.3f} {vel:<12.3f} '
-                                  f'{trq:<12.3f} {tmp:<10.1f}')
-                    else:
-                        self._log_err(f'  {mid:<5} 无响应       {"-":<12} {"-":<12} '
-                                      f'{"-":<12} {"-":<10}')
-                        all_ok = False
-                sock.close()
-            else:
-                self._log(f'  can5 不可用')
-                all_ok = False
-        except Exception as e:
-            self._log_err(f'  RS06 查询异常: {e}')
-            all_ok = False
-
-        # --- UM 轮毂电机 ---
-        self._log('\n【底盘驱动 UM 轮毂电机】')
-        try:
-            if self._iface_up('can4'):
-                sock = cu.open_can_socket('can4', recv_timeout_s=0.3)
-                self._log(f'  CAN: can4  node_id={cu.UM_NODE_IDS}')
-                self._log('  Node   状态                                      StatusWord')
-                self._log('  -------------------------------------------------------')
-                for nid in cu.UM_NODE_IDS:
-                    ok, sw, state_str = cu.um_get_status(sock, nid)
-                    if ok:
-                        self._log(f'  {nid:<6} {state_str}🔴响应[正常]              0x{sw:04X}')
-                    else:
-                        self._log_err(f'  {nid:<6} 无响应                                    -')
-                        all_ok = False
-                sock.close()
-            else:
-                self._log(f'  can4 不可用')
-                all_ok = False
-        except Exception as e:
-            self._log_err(f'  UM 查询异常: {e}')
-            all_ok = False
-
-        # --- 双臂 ---
-        self._log('\n【双臂】')
-        try:
-            from openarmx_arm_driver import Robot
-            robot = Robot(
-                right_can_channel='can0', left_can_channel='can1',
-                auto_enable_can=False,
+            import subprocess
+            result = subprocess.run(
+                ['python3', script_path],
+                capture_output=True,
+                text=True,
+                timeout=30
             )
-            # capture show_all_status output
-            import io, contextlib
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                robot.show_all_status()
-            self._log(buf.getvalue().rstrip())
-            robot.shutdown()
-        except ImportError:
-            self._log('  openarmx_arm_driver 未安装，跳过双臂')
-        except Exception as e:
-            self._log_err(f'  双臂查询异常: {e}')
-            all_ok = False
 
-        # --- 头部 ---
-        self._log('\n【头部】')
-        try:
-            from openarmx_arm_driver import Arm
-            arm = Arm(
-                can_channel='can2', side='right',
-                motor_ids=[1, 2], auto_enable_can=False,
-            )
-            import io, contextlib
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                arm.show_motor_status()
-            self._log(buf.getvalue().rstrip())
-            arm.close()
-        except ImportError:
-            self._log('  openarmx_arm_driver 未安装，跳过头部')
+            # 输出脚本结果
+            if result.stdout:
+                self._log(result.stdout.rstrip())
+            if result.stderr:
+                self._log_err(result.stderr.rstrip())
+
+            all_ok = (result.returncode == 0)
+        except subprocess.TimeoutExpired:
+            self._log_err('检查超时（30秒）')
+            all_ok = False
         except Exception as e:
-            self._log_err(f'  头部查询异常: {e}')
+            self._log_err(f'执行脚本异常: {e}')
             all_ok = False
 
         self._log('')
@@ -773,73 +703,98 @@ class MainWindow(QMainWindow):
         self._stop_process(self._proc_keyboard, self.dot_keyboard,
                            self.btn_keyboard_start, self.btn_keyboard_stop, '键盘底盘控制')
 
-    # ── 6. 电量显示 ─────────────────────────────────────────────
-    def _on_start_battery(self):
-        if self._proc_battery and self._proc_battery.state() != QProcess.NotRunning:
-            self._log('电量显示已在运行中')
+    # ── 6. 传感器检测 (Ultra版) ────────────────────────────────────
+    def _on_start_camera_viewer(self):
+        if self._proc_camera and self._proc_camera.state() != QProcess.NotRunning:
+            self._log('RealSense 相机查看器已在运行中')
             return
 
         self._log('=' * 50)
-        self._log('准备显示电量...')
-        self.btn_battery_start.setEnabled(False)
-        self.btn_battery_stop.setEnabled(False)
-        self.dot_battery.set_state('running')
-        threading.Thread(target=self._battery_permission_then_launch, daemon=True).start()
+        self._log('启动 RealSense 相机查看器...')
+        self.btn_camera.setEnabled(False)
 
-    def _battery_permission_then_launch(self):
-        if not os.path.exists(_BATTERY_SERIAL_HELPER):
-            self._log_err(f'电池串口 helper 不存在: {_BATTERY_SERIAL_HELPER}')
-            self._call_ui(lambda: self.dot_battery.set_state('error'))
-            self._call_ui(lambda: self.btn_battery_start.setEnabled(True))
+        proc = QProcess(self)
+        proc.setProcessChannelMode(QProcess.MergedChannels)
+        proc.readyReadStandardOutput.connect(lambda: self._on_proc_output(proc))
+        proc.finished.connect(lambda code, status: self._on_camera_finished(code, status))
+
+        proc.start('realsense-viewer')
+        if not proc.waitForStarted(5000):
+            self._log_err('RealSense Viewer 启动失败')
+            self.btn_camera.setEnabled(True)
+        else:
+            self._log_ok('RealSense Viewer 已启动')
+            self._proc_camera = proc
+
+    def _on_camera_finished(self, code, status):
+        if code == 0:
+            self._log('RealSense Viewer 已退出')
+        else:
+            self._log_err(f'RealSense Viewer 退出 (code={code})')
+        self.btn_camera.setEnabled(True)
+        self._proc_camera = None
+
+    def _on_start_lidar_viewer(self):
+        if self._proc_lidar and self._proc_lidar.state() != QProcess.NotRunning:
+            self._log('Livox 激光雷达查看器已在运行中')
             return
 
-        try:
-            ret = subprocess.run(
-                ['bash', _BATTERY_SERIAL_HELPER],
-                capture_output=True, text=True, timeout=60
-            )
-        except subprocess.TimeoutExpired:
-            self._log_err('电池串口 helper 执行超时')
-            self._call_ui(lambda: self.dot_battery.set_state('error'))
-            self._call_ui(lambda: self.btn_battery_start.setEnabled(True))
-            return
-        except Exception as e:
-            self._log_err(f'执行电池串口 helper 异常: {e}')
-            self._call_ui(lambda: self.dot_battery.set_state('error'))
-            self._call_ui(lambda: self.btn_battery_start.setEnabled(True))
-            return
+        self._log('=' * 50)
+        self._log('启动 Livox Mid-360S 激光雷达查看器...')
+        self.btn_lidar.setEnabled(False)
+        self.btn_lidar_stop.setEnabled(True)
 
-        output = (ret.stdout or '').strip()
-        err_output = (ret.stderr or '').strip()
-        if output:
-            for line in output.splitlines():
-                self._log(line)
-        if err_output:
-            for line in err_output.splitlines():
-                self._log_err(line)
-
-        if ret.returncode != 0:
-            self._log_err(f'电池串口 helper 退出失败 (code={ret.returncode})')
-            self._call_ui(lambda: self.dot_battery.set_state('error'))
-            self._call_ui(lambda: self.btn_battery_start.setEnabled(True))
-            return
-
-        self._call_ui(self._launch_battery_monitor)
-
-    def _launch_battery_monitor(self):
-        self._log('启动电量显示...')
         cmd = (
             f'source {_SETUP_BASH} && '
-            'ros2 launch openarmx_battery_monitor auto_pack_overlay.launch.py '
-            'start_rviz:=false'
-        )
-        self._proc_battery = self._launch_process(
-            cmd, self.dot_battery, self.btn_battery_start, self.btn_battery_stop, '电量显示'
+            'ros2 launch livox_ros_driver2 rviz_MID360_launch.py'
         )
 
-    def _on_stop_battery(self):
-        self._stop_process(self._proc_battery, self.dot_battery,
-                           self.btn_battery_start, self.btn_battery_stop, '电量显示')
+        proc = QProcess(self)
+        proc.setProcessChannelMode(QProcess.MergedChannels)
+        proc.readyReadStandardOutput.connect(lambda: self._on_proc_output(proc))
+        proc.finished.connect(lambda code, status: self._on_lidar_finished(code, status))
+
+        proc.start('setsid', ['--wait', 'bash', '-c', cmd])
+        if not proc.waitForStarted(5000):
+            self._log_err('Livox 激光雷达查看器启动失败')
+            self.btn_lidar.setEnabled(True)
+            self.btn_lidar_stop.setEnabled(False)
+        else:
+            self._log_ok(f'Livox 激光雷达查看器已启动 (PID: {proc.processId()})')
+            self._proc_lidar = proc
+
+    def _on_stop_lidar_viewer(self):
+        if self._proc_lidar is None or self._proc_lidar.state() == QProcess.NotRunning:
+            self._log('Livox 激光雷达查看器未在运行')
+            return
+
+        self._log('正在停止 Livox 激光雷达查看器...')
+        # 向整个进程组发 SIGINT（让 ros2 launch 优雅退出）
+        pid = self._proc_lidar.processId()
+        if pid:
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGINT)
+            except (ProcessLookupError, PermissionError):
+                self._proc_lidar.terminate()
+        else:
+            self._proc_lidar.terminate()
+
+        # 如果 3 秒内没退出就 kill
+        QTimer.singleShot(3000, lambda: self._force_kill_lidar())
+
+    def _force_kill_lidar(self):
+        if self._proc_lidar and self._proc_lidar.state() != QProcess.NotRunning:
+            self._log('Livox 激光雷达查看器未响应 SIGINT，强制终止')
+            self._proc_lidar.kill()
+
+    def _on_lidar_finished(self, code, status):
+        if code == 0:
+            self._log('Livox 激光雷达查看器已退出')
+        else:
+            self._log_err(f'Livox 激光雷达查看器退出 (code={code})')
+        self.btn_lidar.setEnabled(True)
+        self.btn_lidar_stop.setEnabled(False)
+        self._proc_lidar = None
 
     # ── QProcess 辅助 ────────────────────────────────────────────
     def _launch_process(self, cmd: str, dot: StatusDot, btn_start: QPushButton,
@@ -961,7 +916,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        for proc in [self._proc_bringup, self._proc_vr, self._proc_keyboard, self._proc_battery]:
+        for proc in [self._proc_bringup, self._proc_vr, self._proc_keyboard, self._proc_camera, self._proc_lidar]:
             if proc and proc.state() != QProcess.NotRunning:
                 pid = proc.processId()
                 if pid:
