@@ -5,6 +5,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BATTERY_SERIAL_HELPER="${SCRIPT_DIR}/enable_battery_serial_helper.sh"
+
 declare -A ROBOT_CAN_CONFIG=(
     [can0]=1000000
     [can1]=1000000
@@ -58,6 +61,17 @@ for iface in $(printf '%s\n' "${!ROBOT_CAN_CONFIG[@]}" | sort); do
         success=$((success + 1))
     fi
 done
+
+echo "=================================================="
+echo "Preparing battery serial access"
+echo "=================================================="
+if [[ -f "${BATTERY_SERIAL_HELPER}" ]]; then
+    if ! bash "${BATTERY_SERIAL_HELPER}"; then
+        echo "[WARN] Battery serial permission was not prepared; CAN setup will continue"
+    fi
+else
+    echo "[WARN] Battery serial helper not found: ${BATTERY_SERIAL_HELPER}"
+fi
 
 echo "=================================================="
 echo "CAN enable complete: ${success}/${total}"

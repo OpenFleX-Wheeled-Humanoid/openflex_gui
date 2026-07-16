@@ -37,14 +37,12 @@ A desktop control panel that manages CAN bus interfaces, checks motor status, an
 
 ```bash
 # Build
-\nEnglish | [中文](./README-CN.md)
 
 ---
 cd ~/openflex_all/openflex_ws
 colcon build --packages-select openflex_gui
 
 # Run
-\nEnglish | [中文](./README-CN.md)
 
 ---
 ros2 run openflex_gui openflex_gui

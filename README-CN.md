@@ -37,14 +37,12 @@
 
 ```bash
 # 编译
-\n[English](./README.md) | 中文
 
 ---
 cd ~/openflex_all/openflex_ws
 colcon build --packages-select openflex_gui
 
 # 运行
-\n[English](./README.md) | 中文
 
 ---
 ros2 run openflex_gui openflex_gui

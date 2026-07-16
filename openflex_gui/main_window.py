@@ -119,6 +119,8 @@ class MainWindow(QMainWindow):
 
         # 子进程管理
         self._proc_bringup: QProcess | None = None
+        self._proc_battery: QProcess | None = None
+        self._battery_stop_requested = False
         self._proc_vr: QProcess | None = None
         self._proc_keyboard: QProcess | None = None
         self._proc_camera: QProcess | None = None
@@ -578,6 +580,18 @@ class MainWindow(QMainWindow):
             self._log('整机控制已在运行中')
             return
 
+        unavailable_can = [
+            iface for iface in ROBOT_CAN_CONFIG
+            if not self._iface_exists(iface) or not self._iface_up(iface)
+        ]
+        if unavailable_can:
+            self._log_err(
+                '整机控制启动已取消，请先启用全部 CAN。'
+                f'未就绪通道: {", ".join(unavailable_can)}'
+            )
+            self.dot_bringup.set_state('error')
+            return
+
         self._log('=' * 50)
         self._log('启动整机控制...')
 
@@ -598,6 +612,91 @@ class MainWindow(QMainWindow):
         self._proc_bringup = self._launch_process(
             cmd, self.dot_bringup, self.btn_bringup_start, self.btn_bringup_stop, '整机控制'
         )
+        if self._proc_bringup.state() != QProcess.NotRunning:
+            self._start_battery_monitor()
+
+    def _battery_node_is_running(self) -> bool:
+        cmd = f'source {_SETUP_BASH} && ros2 node list'
+        try:
+            ret = subprocess.run(
+                ['bash', '-c', cmd],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return False
+        if ret.returncode != 0:
+            return False
+        battery_node_names = {
+            'jd_battery_node',
+            'jd_battery_multi_node',
+            'jd_battery_master_dual_node',
+        }
+        return any(
+            name.rstrip('/').rsplit('/', 1)[-1] in battery_node_names
+            for name in ret.stdout.splitlines()
+        )
+
+    def _start_battery_monitor(self):
+        if self._proc_battery and self._proc_battery.state() != QProcess.NotRunning:
+            self._log('电池监控已由本界面启动')
+            return
+        if self._battery_node_is_running():
+            self._log_ok('检测到电池监控节点已在运行，继续使用现有节点')
+            return
+
+        self._log('启动电池监控...')
+        cmd = (
+            f'source {_SETUP_BASH} && '
+            'ros2 launch openarmx_battery_monitor auto_pack_overlay.launch.py '
+            'start_rviz:=false '
+            'fix_serial_permission:=false'
+        )
+        proc = QProcess(self)
+        proc.setProcessChannelMode(QProcess.MergedChannels)
+        proc.readyReadStandardOutput.connect(lambda: self._on_proc_output(proc))
+        proc.finished.connect(
+            lambda code, status: self._on_battery_finished(proc, code, status)
+        )
+        self._proc_battery = proc
+        self._battery_stop_requested = False
+        proc.start('setsid', ['--wait', 'bash', '-c', cmd])
+        if not proc.waitForStarted(5000):
+            self._log_err('电池监控启动失败，整机控制将继续运行')
+            self._proc_battery = None
+        else:
+            self._log_ok(f'电池监控已启动 (PID: {proc.processId()})')
+
+    def _stop_battery_monitor(self):
+        proc = self._proc_battery
+        if (
+            proc is None
+            or proc.state() == QProcess.NotRunning
+            or self._battery_stop_requested
+        ):
+            return
+        self._battery_stop_requested = True
+        self._log('正在停止电池监控...')
+        pid = proc.processId()
+        if pid:
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGINT)
+            except (ProcessLookupError, PermissionError):
+                proc.terminate()
+        else:
+            proc.terminate()
+        QTimer.singleShot(3000, lambda: self._force_kill(proc, '电池监控'))
+
+    def _on_battery_finished(self, proc: QProcess, code, status):
+        if self._proc_battery is proc:
+            self._proc_battery = None
+        was_stopping = self._battery_stop_requested
+        self._battery_stop_requested = False
+        if code == 0 or was_stopping:
+            self._log('电池监控已退出')
+        else:
+            self._log_err(f'电池监控退出 (code={code})，整机控制继续运行')
 
     def _on_stop_bringup(self):
         self._auto_start_vr_pending = False
@@ -641,6 +740,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._do_stop_bringup)
 
     def _do_stop_bringup(self):
+        self._stop_battery_monitor()
         self._stop_process(self._proc_bringup, self.dot_bringup,
                            self.btn_bringup_start, self.btn_bringup_stop, '整机控制')
 
@@ -868,6 +968,7 @@ class MainWindow(QMainWindow):
     def _on_proc_finished(self, code, status, dot, btn_start, btn_stop, label):
         if label == '整机控制':
             self._auto_start_vr_pending = False
+            self._stop_battery_monitor()
         if code == 0:
             self._log(f'{label} 已正常退出')
             dot.set_state('idle')
@@ -916,7 +1017,15 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        for proc in [self._proc_bringup, self._proc_vr, self._proc_keyboard, self._proc_camera, self._proc_lidar]:
+        processes = [
+            self._proc_battery,
+            self._proc_bringup,
+            self._proc_vr,
+            self._proc_keyboard,
+            self._proc_camera,
+            self._proc_lidar,
+        ]
+        for proc in processes:
             if proc and proc.state() != QProcess.NotRunning:
                 pid = proc.processId()
                 if pid:
