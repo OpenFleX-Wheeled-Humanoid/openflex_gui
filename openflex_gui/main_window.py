@@ -14,13 +14,13 @@ import socket
 import struct
 import time
 import threading
-import shutil
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QTextEdit, QLabel, QGroupBox, QSizePolicy, QFrame, QCheckBox
+    QPushButton, QTextEdit, QLabel, QGroupBox, QSizePolicy, QFrame, QCheckBox,
+    QToolButton, QStyle
 )
-from PyQt5.QtCore import Qt, QProcess, pyqtSignal, QObject, QTimer
+from PyQt5.QtCore import Qt, QProcess, QProcessEnvironment, pyqtSignal, QObject, QTimer
 from PyQt5.QtGui import QFont, QColor, QTextCursor
 
 # ─── 项目路径 ──────────────────────────────────────────────────────
@@ -48,7 +48,10 @@ _SETUP_BASH = os.path.join(_WORKSPACE_DIR, 'install', 'setup.bash')
 _CAN_HELPER = os.path.join(_SCRIPT_DIR, 'enable_can_helper.sh')
 _DISABLE_CAN_HELPER = os.path.join(_SCRIPT_DIR, 'disable_can_helper.sh')
 _BATTERY_SERIAL_HELPER = os.path.join(_SCRIPT_DIR, 'enable_battery_serial_helper.sh')
-_TERMINAL_CANDIDATES = ('gnome-terminal', 'terminator', 'xterm')
+_CAMERA_CONFIG = os.path.join(
+    _WORKSPACE_DIR, 'src', 'openflex_vla', 'config', 'cameras', 'cameras_config_30fps.yaml'
+)
+_REALSENSE_VIEWER = '/usr/bin/realsense-viewer'
 
 # 将 can_utils / check_motor_status 所在目录加入 path
 def _find_motor_scripts_dir() -> str:
@@ -122,8 +125,8 @@ class MainWindow(QMainWindow):
         self._proc_battery: QProcess | None = None
         self._battery_stop_requested = False
         self._proc_vr: QProcess | None = None
-        self._proc_keyboard: QProcess | None = None
         self._proc_camera: QProcess | None = None
+        self._proc_camera_ros: QProcess | None = None
         self._proc_lidar: QProcess | None = None
         self._start_sequence_after_can = False
         self._auto_start_vr_pending = False
@@ -207,32 +210,28 @@ class MainWindow(QMainWindow):
         h4.addWidget(self.btn_vr_stop)
         root.addWidget(grp_vr)
 
-        # --- 5. 键盘底盘控制 ---
-        grp_keyboard = QGroupBox('5. 键盘底盘控制 (ros2 run)')
-        h5 = QHBoxLayout(grp_keyboard)
-        self.dot_keyboard = StatusDot()
-        self.btn_keyboard_start = QPushButton('启动键盘控制底盘')
-        self.btn_keyboard_start.setMinimumHeight(40)
-        self.btn_keyboard_start.clicked.connect(self._on_start_keyboard_teleop)
-        self.btn_keyboard_stop = QPushButton('停止')
-        self.btn_keyboard_stop.setMinimumHeight(40)
-        self.btn_keyboard_stop.setFixedWidth(80)
-        self.btn_keyboard_stop.setEnabled(False)
-        self.btn_keyboard_stop.clicked.connect(self._on_stop_keyboard_teleop)
-        h5.addWidget(self.dot_keyboard)
-        h5.addWidget(self.btn_keyboard_start, 1)
-        h5.addWidget(self.btn_keyboard_stop)
-        root.addWidget(grp_keyboard)
-
-        # --- 6. 传感器检测 (Ultra版) ---
-        grp_sensors = QGroupBox('6. 传感器检测 (Ultra版)')
+        # --- 5. 传感器检测 (Ultra版) ---
+        grp_sensors = QGroupBox('5. 传感器检测 (Ultra版)')
         h6 = QHBoxLayout(grp_sensors)
 
-        # 相机查看器按钮
-        self.btn_camera = QPushButton('相机查看器 (RealSense)')
+        self.btn_camera_ros = QPushButton('相机查看 (RealSense ROS2)')
+        self.btn_camera_ros.setMinimumHeight(40)
+        self.btn_camera_ros.setToolTip('启动四路 RGB 相机并在 RViz2 中显示')
+        self.btn_camera_ros.clicked.connect(self._on_start_camera_ros)
+        h6.addWidget(self.btn_camera_ros, 1)
+
+        self.btn_camera = QPushButton('相机查看 (RealSense Viewer)')
         self.btn_camera.setMinimumHeight(40)
         self.btn_camera.clicked.connect(self._on_start_camera_viewer)
         h6.addWidget(self.btn_camera, 1)
+
+        self.btn_camera_stop = QToolButton()
+        self.btn_camera_stop.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
+        self.btn_camera_stop.setFixedSize(40, 40)
+        self.btn_camera_stop.setToolTip('停止当前 RealSense 相机查看')
+        self.btn_camera_stop.setEnabled(False)
+        self.btn_camera_stop.clicked.connect(self._on_stop_camera_viewer)
+        h6.addWidget(self.btn_camera_stop)
 
         # 添加分隔线
         separator = QFrame()
@@ -770,58 +769,136 @@ class MainWindow(QMainWindow):
         self._stop_process(self._proc_vr, self.dot_vr,
                            self.btn_vr_start, self.btn_vr_stop, 'VR 遥操作')
 
-    # ── 5. 键盘底盘控制 ────────────────────────────────────────
-    def _detect_terminal(self) -> str | None:
-        for terminal in _TERMINAL_CANDIDATES:
-            if shutil.which(terminal):
-                return terminal
-        return None
+    # ── 5. 传感器检测 (Ultra版) ────────────────────────────────────
+    def _camera_process_running(self) -> bool:
+        return any(
+            proc is not None and proc.state() != QProcess.NotRunning
+            for proc in (self._proc_camera_ros, self._proc_camera)
+        )
 
-    def _on_start_keyboard_teleop(self):
-        if self._proc_keyboard and self._proc_keyboard.state() != QProcess.NotRunning:
-            self._log('键盘底盘控制已在运行中')
+    def _set_camera_buttons_enabled(self, enabled: bool):
+        self.btn_camera_ros.setEnabled(enabled)
+        self.btn_camera.setEnabled(enabled)
+        self.btn_camera_stop.setEnabled(not enabled)
+
+    @staticmethod
+    def _terminate_camera_process(proc: QProcess, process_group: bool):
+        if proc.state() == QProcess.NotRunning:
+            return
+        if process_group and proc.processId() > 0:
+            try:
+                os.killpg(os.getpgid(proc.processId()), signal.SIGTERM)
+                return
+            except ProcessLookupError:
+                return
+            except OSError:
+                pass
+        proc.terminate()
+
+    @staticmethod
+    def _force_stop_camera_process(proc: QProcess, process_group: bool):
+        if proc.state() == QProcess.NotRunning:
+            return
+        if process_group and proc.processId() > 0:
+            try:
+                os.killpg(os.getpgid(proc.processId()), signal.SIGKILL)
+                return
+            except ProcessLookupError:
+                return
+            except OSError:
+                pass
+        proc.kill()
+
+    def _on_stop_camera_viewer(self):
+        processes = (
+            (self._proc_camera_ros, True),
+            (self._proc_camera, False),
+        )
+        active = [
+            (proc, process_group)
+            for proc, process_group in processes
+            if proc is not None and proc.state() != QProcess.NotRunning
+        ]
+        if not active:
+            self._set_camera_buttons_enabled(True)
             return
 
-        terminal = self._detect_terminal()
-        if terminal is None:
-            self._log_err('未找到可用终端程序，无法启动键盘底盘控制')
-            self.dot_keyboard.set_state('error')
+        self._log('正在停止 RealSense 相机查看...')
+        self.btn_camera_stop.setEnabled(False)
+        for proc, process_group in active:
+            self._terminate_camera_process(proc, process_group)
+            QTimer.singleShot(
+                5000,
+                lambda proc=proc, process_group=process_group:
+                    self._force_stop_camera_process(proc, process_group),
+            )
+
+    def _on_start_camera_ros(self):
+        if self._camera_process_running():
+            self._log('已有 RealSense 查看器在运行；请先关闭其窗口')
+            return
+        if not os.path.exists(_CAMERA_CONFIG):
+            self._log_err(f'相机配置不存在: {_CAMERA_CONFIG}')
             return
 
         self._log('=' * 50)
-        self._log('启动键盘底盘控制...')
+        self._log('启动四路 RealSense RGB 与 RViz2...')
+        self._set_camera_buttons_enabled(False)
         cmd = (
+            'source /opt/ros/humble/setup.bash && '
             f'source {_SETUP_BASH} && '
-            'ros2 run swerve_bringup swerve_teleop.py'
+            'ros2 launch openarmx_lerobot camera_rgb_viewer.launch.py '
+            f'camera_config:={_CAMERA_CONFIG}'
         )
-        self._proc_keyboard = self._launch_terminal_process(
-            terminal, cmd, self.dot_keyboard,
-            self.btn_keyboard_start, self.btn_keyboard_stop, '键盘底盘控制'
+        proc = QProcess(self)
+        proc.setProcessChannelMode(QProcess.MergedChannels)
+        proc.readyReadStandardOutput.connect(lambda: self._on_proc_output(proc))
+        proc.finished.connect(
+            lambda code, status: self._on_camera_ros_finished(proc, code, status)
         )
+        proc.start('setsid', ['--wait', 'bash', '-c', cmd])
+        if not proc.waitForStarted(5000):
+            self._log_err('RealSense ROS2/RViz2 启动失败')
+            self._set_camera_buttons_enabled(True)
+        else:
+            self._proc_camera_ros = proc
+            self._log_ok(f'RealSense ROS2/RViz2 已启动 (PID: {proc.processId()})')
 
-    def _on_stop_keyboard_teleop(self):
-        self._stop_process(self._proc_keyboard, self.dot_keyboard,
-                           self.btn_keyboard_start, self.btn_keyboard_stop, '键盘底盘控制')
+    def _on_camera_ros_finished(self, proc: QProcess, code, status):
+        if self._proc_camera_ros is proc:
+            self._proc_camera_ros = None
+        if code == 0:
+            self._log('RealSense ROS2/RViz2 已退出')
+        else:
+            self._log_err(f'RealSense ROS2/RViz2 退出 (code={code})')
+        self._set_camera_buttons_enabled(True)
 
-    # ── 6. 传感器检测 (Ultra版) ────────────────────────────────────
     def _on_start_camera_viewer(self):
-        if self._proc_camera and self._proc_camera.state() != QProcess.NotRunning:
-            self._log('RealSense 相机查看器已在运行中')
+        if self._camera_process_running():
+            self._log('已有 RealSense 查看器在运行；请先关闭其窗口')
+            return
+        if not os.path.isfile(_REALSENSE_VIEWER):
+            self._log_err(f'RealSense Viewer 不存在: {_REALSENSE_VIEWER}')
             return
 
         self._log('=' * 50)
-        self._log('启动 RealSense 相机查看器...')
-        self.btn_camera.setEnabled(False)
+        self._log('启动 RealSense 相机查看器（ROS Humble 版本）...')
+        self._set_camera_buttons_enabled(False)
 
         proc = QProcess(self)
         proc.setProcessChannelMode(QProcess.MergedChannels)
         proc.readyReadStandardOutput.connect(lambda: self._on_proc_output(proc))
         proc.finished.connect(lambda code, status: self._on_camera_finished(code, status))
 
-        proc.start('realsense-viewer')
+        # The console inherits ROS library paths. Keep this standalone Viewer
+        # on its matching system SDK instead of loading the ROS SDK copy.
+        viewer_env = QProcessEnvironment.systemEnvironment()
+        viewer_env.remove('LD_LIBRARY_PATH')
+        proc.setProcessEnvironment(viewer_env)
+        proc.start(_REALSENSE_VIEWER)
         if not proc.waitForStarted(5000):
             self._log_err('RealSense Viewer 启动失败')
-            self.btn_camera.setEnabled(True)
+            self._set_camera_buttons_enabled(True)
         else:
             self._log_ok('RealSense Viewer 已启动')
             self._proc_camera = proc
@@ -831,7 +908,7 @@ class MainWindow(QMainWindow):
             self._log('RealSense Viewer 已退出')
         else:
             self._log_err(f'RealSense Viewer 退出 (code={code})')
-        self.btn_camera.setEnabled(True)
+        self._set_camera_buttons_enabled(True)
         self._proc_camera = None
 
     def _on_start_lidar_viewer(self):
@@ -923,39 +1000,6 @@ class MainWindow(QMainWindow):
             self._log_ok(f'{label} 已启动 (PID: {proc.processId()})')
         return proc
 
-    def _launch_terminal_process(self, terminal: str, cmd: str, dot: StatusDot,
-                                 btn_start: QPushButton, btn_stop: QPushButton,
-                                 label: str) -> QProcess:
-        proc = QProcess(self)
-        proc.setProcessChannelMode(QProcess.MergedChannels)
-        proc.readyReadStandardOutput.connect(
-            lambda: self._on_proc_output(proc)
-        )
-        proc.finished.connect(
-            lambda code, status: self._on_proc_finished(code, status, dot, btn_start, btn_stop, label)
-        )
-
-        dot.set_state('running')
-        btn_start.setEnabled(False)
-        btn_stop.setEnabled(True)
-
-        if terminal == 'gnome-terminal':
-            args = ['--wait', '--title=OpenFlex 键盘底盘控制', '--', 'bash', '-lc', cmd]
-        elif terminal == 'terminator':
-            args = ['-T', 'OpenFlex 键盘底盘控制', '-x', 'bash', '-lc', cmd]
-        else:
-            args = ['-T', 'OpenFlex 键盘底盘控制', '-e', f'bash -lc "{cmd}"']
-
-        proc.start('setsid', ['--wait', terminal, *args])
-        if not proc.waitForStarted(5000):
-            self._log_err(f'{label} 启动失败')
-            dot.set_state('error')
-            btn_start.setEnabled(True)
-            btn_stop.setEnabled(False)
-        else:
-            self._log_ok(f'{label} 已启动，请在弹出的终端窗口中按键控制底盘')
-        return proc
-
     def _on_proc_output(self, proc: QProcess):
         data = proc.readAllStandardOutput().data()
         try:
@@ -1021,8 +1065,6 @@ class MainWindow(QMainWindow):
             self._proc_battery,
             self._proc_bringup,
             self._proc_vr,
-            self._proc_keyboard,
-            self._proc_camera,
             self._proc_lidar,
         ]
         for proc in processes:
@@ -1036,6 +1078,15 @@ class MainWindow(QMainWindow):
                 else:
                     proc.kill()
                 proc.waitForFinished(3000)
+
+        for proc, process_group in (
+            (self._proc_camera_ros, True),
+            (self._proc_camera, False),
+        ):
+            if proc and proc.state() != QProcess.NotRunning:
+                self._terminate_camera_process(proc, process_group)
+                if not proc.waitForFinished(3000):
+                    self._force_stop_camera_process(proc, process_group)
         event.accept()
 
 
