@@ -49,7 +49,7 @@ class MotorManagerAdapterTest(unittest.TestCase):
         self.assertIs(page.controller, adapter.controller)
         self.assertIs(controller, adapter.controller)
         self.assertIs(adapter.initialize_controller(), controller)
-        self.assertFalse(adapter.has_active_connection())
+        self.assertTrue(adapter.has_active_connection())
 
         controller.column_controller.is_connected = lambda: True
         self.assertTrue(adapter.has_active_connection())

@@ -68,14 +68,9 @@ class MotorManagerAdapter:
     def has_active_connection(self) -> bool:
         if self.controller is None:
             return False
-        for name in ("head_controller", "column_controller", "chassis_controller"):
-            controller = getattr(self.controller, name, None)
-            connected = getattr(controller, "is_connected", False)
-            if callable(connected):
-                connected = connected()
-            if connected:
-                return True
-        return False
+        # MainController constructs both Arm buses eagerly, so controller
+        # existence itself means the direct-maintenance path owns hardware.
+        return True
 
     def shutdown(self) -> None:
         if self.is_shutdown:

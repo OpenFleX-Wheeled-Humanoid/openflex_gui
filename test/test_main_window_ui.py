@@ -49,9 +49,11 @@ class MainWindowUiTest(unittest.TestCase):
             QSettings.Format.IniFormat,
         )
         self.motor_adapter = None
+        self.motor_adapters = []
 
         def create_motor_adapter(manager_dir):
             self.motor_adapter = FakeMotorManagerAdapter(manager_dir)
+            self.motor_adapters.append(self.motor_adapter)
             return self.motor_adapter
 
         with patch.object(MainWindow, "_refresh_can_ui_state", lambda self: None):
@@ -79,6 +81,17 @@ class MainWindowUiTest(unittest.TestCase):
 
         self.assertEqual(self.window.page_stack.currentIndex(), 1)
         self.assertEqual(self.motor_adapter.initialize_calls, 1)
+
+    def test_leaving_motor_page_releases_hardware_and_rebuilds_clean_page(self):
+        self.window._set_page(1)
+        active_adapter = self.motor_adapter
+
+        self.window._set_page(0)
+
+        self.assertEqual(active_adapter.shutdown_calls, 1)
+        self.assertIsNot(self.motor_adapter, active_adapter)
+        self.assertEqual(self.motor_adapter.initialize_calls, 0)
+        self.assertIs(self.window.motor_page, self.motor_adapter.page)
 
     def test_active_motor_maintenance_blocks_bringup(self):
         self.motor_adapter.active = True

@@ -253,11 +253,26 @@ class MainWindow(QMainWindow):
         self._refresh_can_ui_state()
 
     def _set_page(self, index: int):
+        if self.page_stack.currentIndex() == 1 and index != 1:
+            self._release_motor_management()
         if index == 1:
             self._activate_motor_management()
         self.page_stack.setCurrentIndex(index)
         for button_index, button in enumerate(self.nav_buttons):
             button.setChecked(button_index == index)
+
+    def _release_motor_management(self):
+        old_adapter = self.motor_manager_adapter
+        old_page = self.motor_page
+        if old_adapter is not None:
+            old_adapter.shutdown()
+
+        replacement = self._build_motor_management_page()
+        self.page_stack.removeWidget(old_page)
+        self.page_stack.insertWidget(1, replacement)
+        self.motor_page = replacement
+        old_page.deleteLater()
+        self._log('已退出电机维护模式并释放直接硬件连接')
 
     def _activate_motor_management(self):
         adapter = self.motor_manager_adapter

@@ -191,8 +191,9 @@ sensor, theme, VR, and log tests remain green.
 
 - [x] **Step 1: Write failing safety and shutdown tests**
 
-Test that `has_active_connection()` returns true if head, column, or chassis controller is
-connected. Test that repeated adapter shutdown invokes the manager controller once.
+Test that `has_active_connection()` returns true after the manager controller is initialized.
+This strict rule includes the two arm buses, which are opened eagerly by `Robot`. Test that
+repeated adapter shutdown invokes the manager controller once.
 
 Add a GUI test with a fake active adapter and assert `_on_start_bringup()` returns before
 creating a ROS process and logs an explicit maintenance-mode conflict.
@@ -204,9 +205,10 @@ implementation is completed.
 
 - [x] **Step 3: Implement active-connection detection and shutdown**
 
-Inspect the existing controller properties rather than opening hardware. Treat any connected
-head, column, or chassis controller as maintenance-active. Shutdown is guarded by an internal
-flag and delegates to the existing `MainController.shutdown()`.
+Treat an initialized `MainController` as maintenance-active because it creates the two arm
+CAN buses immediately. Shutdown is guarded by an internal flag and delegates to the existing
+`MainController.shutdown()`. Leaving the motor page shuts down the adapter and rebuilds a
+clean, uninitialized page so ROS control can subsequently own the hardware.
 
 - [x] **Step 4: Block conflicting ROS starts**
 
