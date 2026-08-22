@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from PySide6.QtCore import QMetaMethod, QProcess, QSettings
-from PySide6.QtWidgets import QApplication, QFrame, QLabel, QScrollArea, QSizePolicy
+from PySide6.QtWidgets import QApplication, QComboBox, QFrame, QLabel, QScrollArea, QSizePolicy
 
 from openflex_gui.main_window import MainWindow, _ICON_FILE
 
@@ -37,6 +37,25 @@ class FakeMotorManagerAdapter:
         self.is_shutdown = True
 
 
+class FakeDeploymentRunner:
+    def __init__(self, *args, **kwargs):
+        self.output = type("Signal", (), {"connect": lambda self, callback: None})()
+        self.state_changed = type("Signal", (), {"connect": lambda self, callback: None})()
+        self.finished = type("Signal", (), {"connect": lambda self, callback: None})()
+        self.is_running = False
+        self.active_task = None
+        self.starts = []
+        self.cancel_calls = 0
+
+    def start(self, task_id, *, dry_run=False, jobs=1):
+        self.starts.append((task_id, dry_run, jobs))
+        self.is_running = True
+        self.active_task = task_id
+
+    def cancel(self):
+        self.cancel_calls += 1
+
+
 class MainWindowUiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -50,16 +69,22 @@ class MainWindowUiTest(unittest.TestCase):
         )
         self.motor_adapter = None
         self.motor_adapters = []
+        self.deployment_runner = None
 
         def create_motor_adapter(manager_dir):
             self.motor_adapter = FakeMotorManagerAdapter(manager_dir)
             self.motor_adapters.append(self.motor_adapter)
             return self.motor_adapter
 
+        def create_deployment_runner(builder):
+            self.deployment_runner = FakeDeploymentRunner(builder)
+            return self.deployment_runner
+
         with patch.object(MainWindow, "_refresh_can_ui_state", lambda self: None):
             self.window = MainWindow(
                 settings=self.settings,
                 motor_adapter_factory=create_motor_adapter,
+                deployment_runner_factory=create_deployment_runner,
             )
 
     def tearDown(self):
@@ -196,7 +221,62 @@ class MainWindowUiTest(unittest.TestCase):
                 for button in sensor_buttons
             )
         )
-        self.assertIsNotNone(self.window.findChild(QFrame, "deployPlaceholder"))
+        self.assertIsNotNone(self.window.findChild(QComboBox, "deploymentTaskCombo"))
+        self.assertEqual(self.window.deployment_task_combo.count(), 8)
+        self.assertNotIn(
+            "桌面",
+            [
+                self.window.deployment_task_combo.itemText(index)
+                for index in range(self.window.deployment_task_combo.count())
+            ],
+        )
+        self.assertIsNotNone(self.window.btn_deployment_preview)
+        self.assertIsNotNone(self.window.btn_deployment_run)
+        self.assertIsNotNone(self.window.btn_deployment_cancel)
+        self.assertIsNotNone(self.window.deployment_log)
+
+    def test_deployment_preview_uses_validated_command_without_starting(self):
+        self.window.deployment_task_combo.setCurrentIndex(2)
+        self.window.deployment_jobs.setValue(4)
+
+        self.window.btn_deployment_preview.click()
+
+        preview = self.window.deployment_log.toPlainText()
+        self.assertIn("--compile", preview)
+        self.assertIn("--dry-run", preview)
+        self.assertIn("--jobs 4", preview)
+        self.assertEqual(self.deployment_runner.starts, [])
+
+    def test_motor_maintenance_blocks_deployment(self):
+        self.motor_adapter.active = True
+
+        self.window._on_deployment_run()
+
+        self.assertEqual(self.deployment_runner.starts, [])
+        self.assertIn("电机管理", self.window.deployment_log.toPlainText())
+
+    def test_running_deployment_locks_robot_actions(self):
+        self.window._on_deployment_state_changed("running")
+
+        for button in (
+            self.window.btn_enable_can,
+            self.window.btn_bringup_start,
+            self.window.btn_vr_start,
+            self.window.btn_camera_ros,
+            self.window.btn_camera,
+            self.window.btn_lidar,
+        ):
+            self.assertFalse(button.isEnabled())
+        self.assertFalse(self.window.motor_page.isEnabled())
+
+    def test_window_close_cancels_active_deployment(self):
+        self.deployment_runner.is_running = True
+
+        self.window.close()
+        self.app.processEvents()
+
+        self.assertEqual(self.deployment_runner.cancel_calls, 1)
+        self.deployment_runner.is_running = False
 
     def test_window_applies_v13_theme_and_responsive_constraints(self):
         self.assertGreaterEqual(self.window.minimumWidth(), 1024)

@@ -12,18 +12,21 @@ import signal
 import subprocess
 import socket
 import struct
+import shlex
 import time
 import threading
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QLabel, QGroupBox, QSizePolicy, QFrame, QCheckBox,
-    QToolButton, QStyle, QStackedWidget, QScrollArea, QSplitter
+    QToolButton, QStyle, QStackedWidget, QScrollArea, QSplitter, QComboBox,
+    QSpinBox, QMessageBox
 )
 from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, QSettings, Signal, QObject, QTimer
 from PySide6.QtGui import QFont, QColor, QTextCursor, QIcon
 
 from .motor_manager_adapter import MotorManagerAdapter
+from .deployment_runner import DeploymentCommandBuilder, DeploymentRunner, DEPLOYMENT_TASKS
 from .theme_manager import ThemeManager
 
 # ─── 项目路径 ──────────────────────────────────────────────────────
@@ -56,6 +59,9 @@ _CAMERA_CONFIG = os.path.join(
     _WORKSPACE_DIR, 'src', 'openflex_vla', 'config', 'cameras', 'cameras_config_30fps.yaml'
 )
 _REALSENSE_VIEWER = '/usr/bin/realsense-viewer'
+_DEPLOYMENT_SCRIPT = os.path.join(
+    _SRC_DIR, 'OpenFleX', 'install_openflex_drivers_and_build.sh'
+)
 
 # 将 can_utils / check_motor_status 所在目录加入 path
 def _find_motor_scripts_dir() -> str:
@@ -130,7 +136,8 @@ class StatusDot(QLabel):
 
 # ─── 主窗口 ──────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
-    def __init__(self, settings: QSettings | None = None, motor_adapter_factory=None):
+    def __init__(self, settings: QSettings | None = None, motor_adapter_factory=None,
+                 deployment_runner_factory=None):
         super().__init__()
         self.setWindowTitle('OpenFlex VR 全身控制上位机')
         self.setMinimumSize(1024, 700)
@@ -142,8 +149,11 @@ class MainWindow(QMainWindow):
         self._signals.ui.connect(self._run_ui_callback)
         self.theme_manager = ThemeManager(settings)
         self._motor_adapter_factory = motor_adapter_factory or MotorManagerAdapter
+        self._deployment_runner_factory = deployment_runner_factory or DeploymentRunner
         self.motor_manager_adapter = None
         self.motor_page = None
+        self.deployment_runner = None
+        self._deployment_locked_states = None
 
         # 子进程管理
         self._proc_bringup: QProcess | None = None
@@ -253,6 +263,9 @@ class MainWindow(QMainWindow):
         self._refresh_can_ui_state()
 
     def _set_page(self, index: int):
+        if index == 1 and self.deployment_runner and self.deployment_runner.is_running:
+            self._log_err('部署任务运行期间不可进入电机管理')
+            return
         if self.page_stack.currentIndex() == 1 and index != 1:
             self._release_motor_management()
         if index == 1:
@@ -430,7 +443,7 @@ class MainWindow(QMainWindow):
                 font-weight: 700;
             }
             QFrame#controlWorkflow, QFrame#vrCard, QFrame#sensorCard,
-            QFrame#deployPlaceholder {
+            QFrame#deploymentPanel {
                 background: #ffffff;
                 border: 1px solid #d4deea;
                 border-radius: 7px;
@@ -513,6 +526,33 @@ class MainWindow(QMainWindow):
                 color: #53647a;
                 spacing: 7px;
             }
+            QComboBox, QSpinBox {
+                min-height: 34px;
+                padding: 0 10px;
+                color: #33465f;
+                background: #ffffff;
+                border: 1px solid #cbd7e5;
+                border-radius: 5px;
+            }
+            QLabel#deploymentRisk {
+                color: #6b7d93;
+            }
+            QLabel#deploymentFieldLabel {
+                color: #33465f;
+                font-weight: 600;
+            }
+            QLabel#deploymentStatus {
+                color: #176f60;
+                font-weight: 700;
+            }
+            QTextEdit#deploymentLog {
+                background: #172235;
+                color: #b9f3d2;
+                border: 1px solid #263750;
+                border-radius: 7px;
+                padding: 10px;
+                font-family: "JetBrains Mono", "Noto Sans Mono", monospace;
+            }
             QFrame#runtimeLogCard {
                 background: #172235;
                 border: 1px solid #263750;
@@ -553,7 +593,7 @@ class MainWindow(QMainWindow):
                 }
                 QFrame#topBar, QFrame#sideBar,
                 QFrame#controlWorkflow, QFrame#vrCard, QFrame#sensorCard,
-                QFrame#deployPlaceholder, QFrame#panelHeader,
+                QFrame#deploymentPanel, QFrame#panelHeader,
                 QFrame#controlStep, QFrame#controlStep[primaryStep="true"] {
                     background: #182235;
                     border-color: #2c3a4f;
@@ -582,6 +622,20 @@ class MainWindow(QMainWindow):
                 QLabel#panelCopy, QLabel#cardCopy, QLabel#controlStepCopy,
                 QCheckBox {
                     color: #9eacc0;
+                }
+                QComboBox, QSpinBox {
+                    color: #d9e3ef;
+                    background: #111a29;
+                    border-color: #3a4a61;
+                }
+                QLabel#deploymentRisk {
+                    color: #9eacc0;
+                }
+                QLabel#deploymentFieldLabel {
+                    color: #c9d5e5;
+                }
+                QLabel#deploymentStatus {
+                    color: #70dca5;
                 }
                 QLabel#workspaceLabel {
                     color: #8290a5;
@@ -901,8 +955,7 @@ class MainWindow(QMainWindow):
         root.addStretch(1)
         return page
 
-    @staticmethod
-    def _build_deploy_page() -> QWidget:
+    def _build_deploy_page(self) -> QWidget:
         page = QWidget()
         page.setObjectName('deployPage')
         root = QVBoxLayout(page)
@@ -913,22 +966,219 @@ class MainWindow(QMainWindow):
         title.setFont(QFont('Sans', 22, QFont.Bold))
         subtitle = QLabel('管理 OpenFlex 驱动安装和 ROS 2 工作区构建入口。')
         subtitle.setObjectName('pageSubtitle')
-        placeholder = QFrame()
-        placeholder.setObjectName('deployPlaceholder')
-        placeholder_layout = QVBoxLayout(placeholder)
-        placeholder_layout.setContentsMargins(22, 20, 22, 22)
-        heading = QLabel('部署功能尚未接入')
-        heading.setObjectName('cardTitle')
-        copy = QLabel('基础面板仅保留页面位置。接入安装脚本前，不提供可能误触发系统变更的操作按钮。')
-        copy.setObjectName('cardCopy')
-        copy.setWordWrap(True)
-        placeholder_layout.addWidget(heading)
-        placeholder_layout.addWidget(copy)
+        panel = QFrame()
+        panel.setObjectName('deploymentPanel')
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(20, 18, 20, 20)
+        panel_layout.setSpacing(12)
+
+        task_row = QHBoxLayout()
+        task_label = QLabel('部署任务')
+        task_label.setObjectName('deploymentFieldLabel')
+        self.deployment_task_combo = QComboBox()
+        self.deployment_task_combo.setObjectName('deploymentTaskCombo')
+        for task in DEPLOYMENT_TASKS.values():
+            self.deployment_task_combo.addItem(task.label, task.task_id)
+        self.deployment_jobs = QSpinBox()
+        self.deployment_jobs.setObjectName('deploymentJobs')
+        self.deployment_jobs.setRange(1, 32)
+        self.deployment_jobs.setValue(1)
+        self.deployment_jobs.setSuffix(' 线程')
+        self.chk_deployment_dry_run = QCheckBox('仅预览，不修改系统')
+        self.chk_deployment_dry_run.setChecked(True)
+        task_row.addWidget(task_label)
+        task_row.addWidget(self.deployment_task_combo, 1)
+        task_row.addWidget(self.deployment_jobs)
+        task_row.addWidget(self.chk_deployment_dry_run)
+        panel_layout.addLayout(task_row)
+
+        self.deployment_risk_label = QLabel()
+        self.deployment_risk_label.setObjectName('deploymentRisk')
+        self.deployment_risk_label.setWordWrap(True)
+        panel_layout.addWidget(self.deployment_risk_label)
+
+        action_row = QHBoxLayout()
+        self.btn_deployment_preview = self._button('查看命令', 'secondary')
+        self.btn_deployment_run = self._button('开始执行', 'primary')
+        self.btn_deployment_cancel = self._button('取消任务', 'danger')
+        self.btn_deployment_cancel.setEnabled(False)
+        self.deployment_status = QLabel('待执行')
+        self.deployment_status.setObjectName('deploymentStatus')
+        action_row.addWidget(self.btn_deployment_preview)
+        action_row.addWidget(self.btn_deployment_run)
+        action_row.addWidget(self.btn_deployment_cancel)
+        action_row.addStretch(1)
+        action_row.addWidget(self.deployment_status)
+        panel_layout.addLayout(action_row)
+
+        log_header = QLabel('部署日志')
+        log_header.setObjectName('cardTitle')
+        self.deployment_log = QTextEdit()
+        self.deployment_log.setObjectName('deploymentLog')
+        self.deployment_log.setReadOnly(True)
+        self.deployment_log.document().setMaximumBlockCount(3000)
+        self.deployment_log.setMinimumHeight(280)
+
+        self.deployment_command_builder = DeploymentCommandBuilder(
+            _DEPLOYMENT_SCRIPT, _WORKSPACE_DIR
+        )
+        self.deployment_runner = self._deployment_runner_factory(
+            self.deployment_command_builder
+        )
+        self.deployment_runner.output.connect(self._on_deployment_output)
+        self.deployment_runner.state_changed.connect(self._on_deployment_state_changed)
+        self.deployment_runner.finished.connect(self._on_deployment_finished)
+        self.deployment_task_combo.currentIndexChanged.connect(
+            self._update_deployment_task_details
+        )
+        self.btn_deployment_preview.clicked.connect(self._on_deployment_preview)
+        self.btn_deployment_run.clicked.connect(self._on_deployment_run)
+        self.btn_deployment_cancel.clicked.connect(self.deployment_runner.cancel)
+        self._update_deployment_task_details()
+
         root.addWidget(title)
         root.addWidget(subtitle)
-        root.addWidget(placeholder)
-        root.addStretch(1)
+        root.addWidget(panel)
+        root.addWidget(log_header)
+        root.addWidget(self.deployment_log, 1)
         return page
+
+    def _selected_deployment_task_id(self) -> str:
+        return self.deployment_task_combo.currentData()
+
+    def _update_deployment_task_details(self):
+        task = DEPLOYMENT_TASKS[self._selected_deployment_task_id()]
+        terminal_note = '实际执行时将在终端中完成授权或交互。' if task.terminal_required else '任务在控制中心内执行。'
+        self.deployment_risk_label.setText(f'{task.risk}。{terminal_note}')
+        self.deployment_jobs.setEnabled(task.supports_jobs)
+
+    def _deployment_command(self) -> list[str]:
+        return self.deployment_command_builder.build(
+            self._selected_deployment_task_id(),
+            dry_run=self.chk_deployment_dry_run.isChecked(),
+            jobs=self.deployment_jobs.value(),
+        )
+
+    def _on_deployment_preview(self):
+        command = self._deployment_command()
+        self._on_deployment_output('$ ' + shlex.join(command) + '\n')
+
+    def _on_deployment_run(self):
+        task_id = self._selected_deployment_task_id()
+        task = DEPLOYMENT_TASKS[task_id]
+        dry_run = self.chk_deployment_dry_run.isChecked()
+        conflict = self._deployment_conflict_reason()
+        if conflict:
+            self._on_deployment_output(f'[无法启动] {conflict}\n')
+            self.deployment_status.setText('存在运行冲突')
+            return
+        if not dry_run:
+            answer = QMessageBox.question(
+                self,
+                '确认部署任务',
+                f'{task.label}\n\n{task.risk}\n工作空间：{_WORKSPACE_DIR}\n\n确认开始执行？',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            self.deployment_runner.start(
+                task_id,
+                dry_run=dry_run,
+                jobs=self.deployment_jobs.value(),
+            )
+        except Exception as exc:
+            self._on_deployment_output(f'[启动失败] {exc}\n')
+            self._on_deployment_state_changed('failed')
+
+    def _on_deployment_output(self, text: str):
+        cursor = self.deployment_log.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(text)
+        self.deployment_log.setTextCursor(cursor)
+        self.deployment_log.ensureCursorVisible()
+
+    def _on_deployment_state_changed(self, state: str):
+        labels = {
+            'running': '执行中',
+            'success': '执行成功',
+            'failed': '执行失败',
+            'cancelled': '已取消',
+        }
+        running = state == 'running'
+        self.deployment_status.setText(labels.get(state, state))
+        self.btn_deployment_run.setEnabled(not running)
+        self.btn_deployment_preview.setEnabled(not running)
+        self.btn_deployment_cancel.setEnabled(running)
+        self.deployment_task_combo.setEnabled(not running)
+        self.deployment_jobs.setEnabled(
+            not running and DEPLOYMENT_TASKS[self._selected_deployment_task_id()].supports_jobs
+        )
+        self.chk_deployment_dry_run.setEnabled(not running)
+        self._set_robot_actions_locked_for_deployment(running)
+
+    def _on_deployment_finished(self, task_id: str, exit_code: int, success: bool):
+        task = DEPLOYMENT_TASKS.get(task_id)
+        label = task.label if task else task_id
+        result = '完成' if success else '失败'
+        self._on_deployment_output(f'\n[{label}] {result}，退出码 {exit_code}\n')
+
+    @staticmethod
+    def _process_is_running(process) -> bool:
+        return process is not None and process.state() != QProcess.NotRunning
+
+    def _deployment_conflict_reason(self) -> str | None:
+        if self._motor_maintenance_active():
+            return '电机管理仍占用直接硬件连接，请先退出电机管理'
+        process_labels = (
+            (self._proc_bringup, '整机控制仍在运行'),
+            (self._proc_vr, 'VR 遥操作仍在运行'),
+            (self._proc_camera_ros, 'RealSense ROS 任务仍在运行'),
+            (self._proc_camera, 'RealSense Viewer 仍在运行'),
+            (self._proc_lidar, 'Livox 查看任务仍在运行'),
+        )
+        for process, reason in process_labels:
+            if self._process_is_running(process):
+                return reason
+        return None
+
+    def _deployment_runtime_widgets(self):
+        return (
+            self.btn_enable_can,
+            self.btn_disable_can,
+            self.btn_status,
+            self.btn_bringup_start,
+            self.btn_bringup_stop,
+            self.btn_vr_start,
+            self.btn_vr_stop,
+            self.btn_camera_ros,
+            self.btn_camera,
+            self.btn_camera_stop,
+            self.btn_lidar,
+            self.btn_lidar_stop,
+            self.nav_buttons[1],
+            self.motor_page,
+        )
+
+    def _set_robot_actions_locked_for_deployment(self, locked: bool):
+        widgets = self._deployment_runtime_widgets()
+        if locked and self._deployment_locked_states is None:
+            self._deployment_locked_states = {
+                widget: widget.isEnabled() for widget in widgets
+            }
+            for widget in widgets:
+                widget.setEnabled(False)
+        elif not locked and self._deployment_locked_states is not None:
+            for widget, was_enabled in self._deployment_locked_states.items():
+                widget.setEnabled(was_enabled)
+            self._deployment_locked_states = None
+
+    def _deployment_blocks_action(self, action: str) -> bool:
+        if self.deployment_runner and self.deployment_runner.is_running:
+            self._log_err(f'部署任务运行期间不可{action}')
+            return True
+        return False
 
     @staticmethod
     def _button(text: str, variant: str) -> QPushButton:
@@ -1014,6 +1264,8 @@ class MainWindow(QMainWindow):
 
     # ── 1. CAN 总线 ─────────────────────────────────────────────
     def _on_enable_can(self):
+        if self._deployment_blocks_action('启用 CAN'):
+            return
         self._start_enable_can()
 
     def _start_enable_can(self, start_sequence: bool = False):
@@ -1073,6 +1325,8 @@ class MainWindow(QMainWindow):
         self._start_sequence_after_can = False
 
     def _on_disable_can(self):
+        if self._deployment_blocks_action('禁用 CAN'):
+            return
         self._auto_start_vr_pending = False
         self._start_sequence_after_can = False
         self._set_can_buttons_enabled(False, False)
@@ -1139,6 +1393,8 @@ class MainWindow(QMainWindow):
 
     # ── 2. 检查电机状态 ──────────────────────────────────────────
     def _on_check_status(self):
+        if self._deployment_blocks_action('检查电机状态'):
+            return
         self.btn_status.setEnabled(False)
         self.dot_status.set_state('running')
         threading.Thread(target=self._check_status_worker, daemon=True).start()
@@ -1307,6 +1563,8 @@ class MainWindow(QMainWindow):
 
     # ── 3. 整机控制 ──────────────────────────────────────────────
     def _on_start_bringup(self):
+        if self._deployment_blocks_action('启动整机控制'):
+            return
         if self._proc_bringup and self._proc_bringup.state() != QProcess.NotRunning:
             self._log('整机控制已在运行中')
             return
@@ -1483,6 +1741,8 @@ class MainWindow(QMainWindow):
 
     # ── 4. VR 遥操作 ─────────────────────────────────────────────
     def _on_start_vr(self):
+        if self._deployment_blocks_action('启动 VR 遥操作'):
+            return
         self._auto_start_vr_pending = False
         if self._proc_vr and self._proc_vr.state() != QProcess.NotRunning:
             self._log('VR 遥操作已在运行中')
@@ -1580,6 +1840,8 @@ class MainWindow(QMainWindow):
             )
 
     def _on_start_camera_ros(self):
+        if self._deployment_blocks_action('启动 RealSense ROS'):
+            return
         if self._camera_process_running():
             self._log('已有 RealSense 查看器在运行；请先关闭其窗口')
             return
@@ -1620,6 +1882,8 @@ class MainWindow(QMainWindow):
         self._set_camera_buttons_enabled(True)
 
     def _on_start_camera_viewer(self):
+        if self._deployment_blocks_action('启动 RealSense Viewer'):
+            return
         if self._camera_process_running():
             self._log('已有 RealSense 查看器在运行；请先关闭其窗口')
             return
@@ -1658,6 +1922,8 @@ class MainWindow(QMainWindow):
         self._proc_camera = None
 
     def _on_start_lidar_viewer(self):
+        if self._deployment_blocks_action('启动 Livox 查看器'):
+            return
         if self._proc_lidar and self._proc_lidar.state() != QProcess.NotRunning:
             self._log('Livox 激光雷达查看器已在运行中')
             return
@@ -1795,6 +2061,8 @@ class MainWindow(QMainWindow):
 
     # ── 窗口关闭 ─────────────────────────────────────────────────
     def closeEvent(self, event):
+        if self.deployment_runner and self.deployment_runner.is_running:
+            self.deployment_runner.cancel()
         # 关窗前先同步失能底盘（controller_manager 还活着）
         if self._proc_bringup and self._proc_bringup.state() != QProcess.NotRunning:
             cmd = (
