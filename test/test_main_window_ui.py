@@ -3,10 +3,38 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from PySide6.QtCore import QMetaMethod, QSettings
+from PySide6.QtCore import QMetaMethod, QProcess, QSettings
 from PySide6.QtWidgets import QApplication, QFrame, QLabel, QScrollArea, QSizePolicy
 
 from openflex_gui.main_window import MainWindow, _ICON_FILE
+
+
+class FakeMotorManagerAdapter:
+    def __init__(self, manager_dir):
+        self.manager_dir = manager_dir
+        self.page = QFrame()
+        self.page.setObjectName("motorManagementPage")
+        self.themes = []
+        self.is_shutdown = False
+        self.shutdown_calls = 0
+        self.initialize_calls = 0
+        self.active = False
+
+    def create_page(self):
+        return self.page
+
+    def set_theme(self, theme):
+        self.themes.append(theme)
+
+    def initialize_controller(self):
+        self.initialize_calls += 1
+
+    def has_active_connection(self):
+        return self.active
+
+    def shutdown(self):
+        self.shutdown_calls += 1
+        self.is_shutdown = True
 
 
 class MainWindowUiTest(unittest.TestCase):
@@ -20,20 +48,76 @@ class MainWindowUiTest(unittest.TestCase):
             os.path.join(self.settings_dir.name, "openflex-test.ini"),
             QSettings.Format.IniFormat,
         )
+        self.motor_adapter = None
+
+        def create_motor_adapter(manager_dir):
+            self.motor_adapter = FakeMotorManagerAdapter(manager_dir)
+            return self.motor_adapter
+
         with patch.object(MainWindow, "_refresh_can_ui_state", lambda self: None):
-            self.window = MainWindow(settings=self.settings)
+            self.window = MainWindow(
+                settings=self.settings,
+                motor_adapter_factory=create_motor_adapter,
+            )
 
     def tearDown(self):
         self.window.close()
         self.settings_dir.cleanup()
 
-    def test_window_uses_three_page_control_center_navigation(self):
-        self.assertEqual(self.window.page_stack.count(), 3)
+    def test_window_uses_four_page_control_center_navigation(self):
+        self.assertEqual(self.window.page_stack.count(), 4)
         self.assertEqual(self.window.page_stack.currentIndex(), 0)
         self.assertEqual(
             [button.text() for button in self.window.nav_buttons],
-            ["整机控制", "传感器", "部署中心"],
+            ["整机控制", "电机管理", "传感器", "部署中心"],
         )
+        self.assertIs(self.window.motor_page, self.motor_adapter.page)
+        self.assertIs(self.window.motor_manager_adapter, self.motor_adapter)
+        self.assertEqual(self.motor_adapter.initialize_calls, 0)
+
+        self.window._set_page(1)
+
+        self.assertEqual(self.window.page_stack.currentIndex(), 1)
+        self.assertEqual(self.motor_adapter.initialize_calls, 1)
+
+    def test_active_motor_maintenance_blocks_bringup(self):
+        self.motor_adapter.active = True
+
+        self.window._on_start_bringup()
+
+        self.assertIsNone(self.window._proc_bringup)
+        self.assertEqual(self.window.dot_bringup._state, "error")
+        self.assertIn("电机管理", self.window.log_view.toPlainText())
+
+    def test_active_motor_maintenance_blocks_vr(self):
+        self.motor_adapter.active = True
+
+        self.window._on_start_vr()
+
+        self.assertIsNone(self.window._proc_vr)
+        self.assertEqual(self.window.dot_vr._state, "error")
+        self.assertIn("电机管理", self.window.log_view.toPlainText())
+
+    def test_running_bringup_keeps_motor_controller_uninitialized(self):
+        class RunningProcess:
+            @staticmethod
+            def state():
+                return QProcess.Running
+
+        self.window._proc_bringup = RunningProcess()
+
+        self.window._set_page(1)
+
+        self.assertEqual(self.motor_adapter.initialize_calls, 0)
+        self.assertFalse(self.window.motor_page.isEnabled())
+        self.assertIn("暂不可用", self.window.log_view.toPlainText())
+        self.window._proc_bringup = None
+
+    def test_window_close_shuts_down_motor_manager_once(self):
+        self.window.close()
+        self.app.processEvents()
+
+        self.assertEqual(self.motor_adapter.shutdown_calls, 1)
 
     def test_window_uses_pyside6(self):
         self.assertEqual(QApplication.__module__.split(".")[0], "PySide6")

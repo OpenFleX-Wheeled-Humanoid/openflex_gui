@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, QSettings, Signal, QObject, QTimer
 from PySide6.QtGui import QFont, QColor, QTextCursor, QIcon
 
+from .motor_manager_adapter import MotorManagerAdapter
 from .theme_manager import ThemeManager
 
 # ─── 项目路径 ──────────────────────────────────────────────────────
@@ -129,7 +130,7 @@ class StatusDot(QLabel):
 
 # ─── 主窗口 ──────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
-    def __init__(self, settings: QSettings | None = None):
+    def __init__(self, settings: QSettings | None = None, motor_adapter_factory=None):
         super().__init__()
         self.setWindowTitle('OpenFlex VR 全身控制上位机')
         self.setMinimumSize(1024, 700)
@@ -140,6 +141,9 @@ class MainWindow(QMainWindow):
         self._signals.log_html.connect(self._append_log_html)
         self._signals.ui.connect(self._run_ui_callback)
         self.theme_manager = ThemeManager(settings)
+        self._motor_adapter_factory = motor_adapter_factory or MotorManagerAdapter
+        self.motor_manager_adapter = None
+        self.motor_page = None
 
         # 子进程管理
         self._proc_bringup: QProcess | None = None
@@ -220,7 +224,7 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(workspace_label)
 
         self.nav_buttons = []
-        for index, text in enumerate(('整机控制', '传感器', '部署中心')):
+        for index, text in enumerate(('整机控制', '电机管理', '传感器', '部署中心')):
             button = QPushButton(text)
             button.setObjectName('navButton')
             button.setCheckable(True)
@@ -240,7 +244,8 @@ class MainWindow(QMainWindow):
         body_layout.addWidget(self.page_stack, 1)
 
         self.page_stack.addWidget(self._scroll_page(self._build_control_page()))
-
+        self.motor_page = self._build_motor_management_page()
+        self.page_stack.addWidget(self.motor_page)
         self.page_stack.addWidget(self._scroll_page(self._build_sensors_page()))
         self.page_stack.addWidget(self._scroll_page(self._build_deploy_page()))
         self._set_page(0)
@@ -248,9 +253,54 @@ class MainWindow(QMainWindow):
         self._refresh_can_ui_state()
 
     def _set_page(self, index: int):
+        if index == 1:
+            self._activate_motor_management()
         self.page_stack.setCurrentIndex(index)
         for button_index, button in enumerate(self.nav_buttons):
             button.setChecked(button_index == index)
+
+    def _activate_motor_management(self):
+        adapter = self.motor_manager_adapter
+        if adapter is None:
+            return
+        processes = (self._proc_bringup, self._proc_vr)
+        if any(
+            proc is not None and proc.state() != QProcess.NotRunning
+            for proc in processes
+        ):
+            self._log_err('电机管理暂不可用：请先停止整机控制和 VR 遥操作')
+            self._update_motor_page_lock()
+            return
+        try:
+            adapter.initialize_controller()
+            self.motor_page.setEnabled(True)
+            self.motor_page.setToolTip('')
+        except Exception as exc:
+            self.motor_page.setEnabled(False)
+            self.motor_page.setToolTip(f'电机控制器初始化失败: {exc}')
+            self._log_err(f'电机控制器初始化失败: {exc}')
+
+    def _build_motor_management_page(self) -> QWidget:
+        manager_dir = os.path.join(
+            _SRC_DIR, 'openflex_integrated', 'openflex_manager'
+        )
+        try:
+            adapter = self._motor_adapter_factory(manager_dir)
+            page = adapter.create_page()
+            adapter.set_theme(self.theme_manager.current_theme)
+            if hasattr(page, 'btn_theme_toggle'):
+                page.btn_theme_toggle.hide()
+            self.motor_manager_adapter = adapter
+            return page
+        except Exception as exc:
+            self.motor_manager_adapter = None
+            self._log_err(f'电机管理加载失败: {exc}')
+            error_page = self._placeholder_page(
+                '电机管理不可用',
+                f'无法加载 {manager_dir}\n{exc}',
+            )
+            error_page.setObjectName('motorManagementErrorPage')
+            return error_page
 
     @staticmethod
     def _scroll_page(page: QWidget) -> QScrollArea:
@@ -583,6 +633,8 @@ class MainWindow(QMainWindow):
             """
         self.setStyleSheet(stylesheet)
         self._update_theme_button()
+        if self.motor_manager_adapter is not None:
+            self.motor_manager_adapter.set_theme(self.theme_manager.current_theme)
 
     def _toggle_theme(self):
         self.theme_manager.toggle()
@@ -1219,10 +1271,34 @@ class MainWindow(QMainWindow):
                 return False
         return True
 
+    def _motor_maintenance_active(self) -> bool:
+        return bool(
+            self.motor_manager_adapter is not None
+            and self.motor_manager_adapter.has_active_connection()
+        )
+
+    def _update_motor_page_lock(self):
+        processes = (self._proc_bringup, self._proc_vr)
+        locked = any(
+            proc is not None and proc.state() != QProcess.NotRunning
+            for proc in processes
+        )
+        if self.motor_page is not None:
+            self.motor_page.setEnabled(not locked)
+            self.motor_page.setToolTip(
+                '整机控制或 VR 运行期间不可使用直接电机管理'
+                if locked else ''
+            )
+
     # ── 3. 整机控制 ──────────────────────────────────────────────
     def _on_start_bringup(self):
         if self._proc_bringup and self._proc_bringup.state() != QProcess.NotRunning:
             self._log('整机控制已在运行中')
+            return
+
+        if self._motor_maintenance_active():
+            self._log_err('整机控制启动已取消：电机管理仍有直接硬件连接，请先断开')
+            self.dot_bringup.set_state('error')
             return
 
         unavailable_can = [
@@ -1258,6 +1334,7 @@ class MainWindow(QMainWindow):
             cmd, self.dot_bringup, self.btn_bringup_start, self.btn_bringup_stop, '整机控制'
         )
         if self._proc_bringup.state() != QProcess.NotRunning:
+            self._update_motor_page_lock()
             self._start_battery_monitor()
 
     def _battery_node_is_running(self) -> bool:
@@ -1396,6 +1473,12 @@ class MainWindow(QMainWindow):
             self._log('VR 遥操作已在运行中')
             return
 
+
+        if self._motor_maintenance_active():
+            self._log_err('VR 遥操作启动已取消：电机管理仍有直接硬件连接，请先断开')
+            self.dot_vr.set_state('error')
+            return
+
         self._log('=' * 50)
         self._log('启动 VR 遥操作...')
 
@@ -1409,6 +1492,8 @@ class MainWindow(QMainWindow):
         self._proc_vr = self._launch_process(
             cmd, self.dot_vr, self.btn_vr_start, self.btn_vr_stop, 'VR 遥操作'
         )
+        if self._proc_vr.state() != QProcess.NotRunning:
+            self._update_motor_page_lock()
 
     def _on_stop_vr(self):
         self._auto_start_vr_pending = False
@@ -1667,6 +1752,7 @@ class MainWindow(QMainWindow):
             dot.set_state('error')
         btn_start.setEnabled(True)
         btn_stop.setEnabled(False)
+        self._update_motor_page_lock()
 
     def _stop_process(self, proc: QProcess | None, dot: StatusDot,
                       btn_start: QPushButton, btn_stop: QPushButton, label: str):
@@ -1733,6 +1819,8 @@ class MainWindow(QMainWindow):
                 self._terminate_camera_process(proc, process_group)
                 if not proc.waitForFinished(3000):
                     self._force_stop_camera_process(proc, process_group)
+        if self.motor_manager_adapter is not None:
+            self.motor_manager_adapter.shutdown()
         event.accept()
 
 

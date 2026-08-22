@@ -18,7 +18,7 @@
 - Modify: `../openflex_manager/main.py`
 - Create: `../openflex_manager/tests/test_embedded_page.py`
 
-- [ ] **Step 1: Write a failing embedded-page test**
+- [x] **Step 1: Write a failing embedded-page test**
 
 Create a `unittest.TestCase` that constructs `MotorManagementPage` offscreen and asserts:
 
@@ -34,7 +34,7 @@ self.assertTrue(hasattr(page, "btn_start_can"))
 self.assertTrue(hasattr(page, "btn_chassis_estop"))
 ```
 
-- [ ] **Step 2: Verify the test fails because `MotorManagementPage` is missing**
+- [x] **Step 2: Verify the test fails because `MotorManagementPage` is missing**
 
 Run:
 
@@ -44,7 +44,7 @@ QT_QPA_PLATFORM=offscreen python3 -m unittest discover -v -s tests -p 'test_*.py
 
 Expected: the new test fails while importing `MotorManagementPage`.
 
-- [ ] **Step 3: Refactor the manager UI class**
+- [x] **Step 3: Refactor the manager UI class**
 
 Rename the existing UI implementation to `MotorManagementPage(QWidget)`. Build its root
 layout directly on `self` and add a `QMenuBar` widget instead of calling
@@ -67,13 +67,13 @@ class OpenFlexMainWindow(QMainWindow):
 
 Expose `MotorManagementPage` and `OpenFlexMainWindow` from `ui/__init__.py`.
 
-- [ ] **Step 4: Preserve standalone startup**
+- [x] **Step 4: Preserve standalone startup**
 
 Update `main.py` so the controller binds to `window.motor_page`, then assign the controller
 to both the wrapper and the page. Showing `OpenFlexMainWindow` must still start the original
 standalone manager.
 
-- [ ] **Step 5: Run manager tests and an offscreen standalone smoke test**
+- [x] **Step 5: Run manager tests and an offscreen standalone smoke test**
 
 Run:
 
@@ -91,7 +91,7 @@ by `timeout` rather than crashing.
 - Create: `openflex_gui/motor_manager_adapter.py`
 - Create: `test/test_motor_manager_adapter.py`
 
-- [ ] **Step 1: Write adapter path and construction tests**
+- [x] **Step 1: Write adapter path and construction tests**
 
 The test obtains the sibling manager directory from the release workspace, constructs the
 adapter with that explicit path, and verifies:
@@ -105,21 +105,23 @@ self.assertEqual(page.left_tabs.count(), 4)
 
 The test calls `adapter.shutdown()` and confirms repeated shutdown is harmless.
 
-- [ ] **Step 2: Verify the adapter test fails**
+- [x] **Step 2: Verify the adapter test fails**
 
 Run the GUI test suite and expect failure because `motor_manager_adapter.py` is missing.
 
-- [ ] **Step 3: Implement deterministic source loading**
+- [x] **Step 3: Implement deterministic source loading**
 
 `MotorManagerAdapter` accepts a manager directory, validates `main.py`, `ui/`,
 `controllers/`, and `config/`, and inserts only that absolute directory at the front of
-`sys.path`. It imports `MotorManagementPage` and `MainController`, creates one page and one
-controller, stores both, and never launches another `QApplication`.
+`sys.path`. It imports `MotorManagementPage`, creates one page, and never launches another
+`QApplication`. Hardware-facing `MainController` construction is deferred until the user
+opens the motor-management page while ROS control processes are stopped.
 
 Provide:
 
 ```python
 def create_page(self) -> QWidget
+def initialize_controller(self)
 def set_theme(self, theme: str) -> None
 def has_active_connection(self) -> bool
 def shutdown(self) -> None
@@ -127,7 +129,7 @@ def shutdown(self) -> None
 
 Map control-center `day` to manager `light`, and `night` to manager `dark`.
 
-- [ ] **Step 4: Run adapter and manager tests**
+- [x] **Step 4: Run adapter and manager tests**
 
 Expected: four-tab page construction, theme mapping, and idempotent shutdown pass without
 starting CAN.
@@ -138,7 +140,7 @@ starting CAN.
 - Modify: `openflex_gui/main_window.py`
 - Modify: `test/test_main_window_ui.py`
 
-- [ ] **Step 1: Write failing navigation and embedding tests**
+- [x] **Step 1: Write failing navigation and embedding tests**
 
 Update the expected navigation to:
 
@@ -149,11 +151,11 @@ Update the expected navigation to:
 Assert four pages, and assert `window.motor_page` is the exact widget stored by
 `window.motor_manager_adapter`.
 
-- [ ] **Step 2: Verify tests fail with the current three-page navigation**
+- [x] **Step 2: Verify tests fail with the current three-page navigation**
 
 Run all GUI tests. Expected: navigation count and labels fail.
 
-- [ ] **Step 3: Create and insert the manager page**
+- [x] **Step 3: Create and insert the manager page**
 
 Construct `MotorManagerAdapter` after workspace discovery, call `create_page()`, insert the
 page directly into `page_stack` between control and sensors, and add the matching nav label.
@@ -164,7 +166,7 @@ If manager loading fails, show a non-interactive error page containing the missi
 dependency, keep the rest of the control center usable, and record the exception in runtime
 diagnostics.
 
-- [ ] **Step 4: Synchronize the global theme**
+- [x] **Step 4: Synchronize the global theme**
 
 After every global theme application, call:
 
@@ -175,7 +177,7 @@ self.motor_manager_adapter.set_theme(self.theme_manager.current_theme)
 Hide the manager-local theme button so the top-bar sun/moon button is the single theme
 control.
 
-- [ ] **Step 5: Run all manager and GUI tests**
+- [x] **Step 5: Run all manager and GUI tests**
 
 Expected: the new page is embedded, all four subsystem tabs exist, and prior control,
 sensor, theme, VR, and log tests remain green.
@@ -187,7 +189,7 @@ sensor, theme, VR, and log tests remain green.
 - Modify: `openflex_gui/motor_manager_adapter.py`
 - Modify: `test/test_motor_manager_adapter.py`
 
-- [ ] **Step 1: Write failing safety and shutdown tests**
+- [x] **Step 1: Write failing safety and shutdown tests**
 
 Test that `has_active_connection()` returns true if head, column, or chassis controller is
 connected. Test that repeated adapter shutdown invokes the manager controller once.
@@ -195,18 +197,18 @@ connected. Test that repeated adapter shutdown invokes the manager controller on
 Add a GUI test with a fake active adapter and assert `_on_start_bringup()` returns before
 creating a ROS process and logs an explicit maintenance-mode conflict.
 
-- [ ] **Step 2: Verify the tests fail**
+- [x] **Step 2: Verify the tests fail**
 
 Expected: active connection detection and idempotent shutdown tests fail before the adapter
 implementation is completed.
 
-- [ ] **Step 3: Implement active-connection detection and shutdown**
+- [x] **Step 3: Implement active-connection detection and shutdown**
 
 Inspect the existing controller properties rather than opening hardware. Treat any connected
 head, column, or chassis controller as maintenance-active. Shutdown is guarded by an internal
 flag and delegates to the existing `MainController.shutdown()`.
 
-- [ ] **Step 4: Block conflicting ROS starts**
+- [x] **Step 4: Block conflicting ROS starts**
 
 Before starting bringup or VR, check the adapter. If maintenance is active, leave all process
 references unchanged, set the relevant status indicator to error, and log that direct motor
@@ -216,12 +218,12 @@ While bringup or VR is running, disable the embedded motor page. Re-enable it af
 processes stop. This is the initial strict interlock; later runtime-coordinator work will also
 detect externally started ROS processes.
 
-- [ ] **Step 5: Integrate manager cleanup into window close**
+- [x] **Step 5: Integrate manager cleanup into window close**
 
 After stopping control-center child processes, call adapter shutdown. Manager shutdown stops
 monitoring and motion, disables supported devices, and closes its direct hardware links.
 
-- [ ] **Step 6: Run all tests, build, and visually verify**
+- [x] **Step 6: Run all tests, build, and visually verify**
 
 Run manager tests, GUI tests, Python compilation, `git diff --check`, and:
 
