@@ -18,7 +18,7 @@
 - Modify: `setup.py`
 - Modify: `package.xml`
 
-- [ ] **Step 1: Change the UI test import and add a Qt binding assertion**
+- [x] **Step 1: Change the UI test import and add a Qt binding assertion**
 
 Replace the Qt import with:
 
@@ -34,7 +34,7 @@ def test_window_uses_pyside6(self):
     self.assertEqual(QApplication.__module__.split(".")[0], "PySide6")
 ```
 
-- [ ] **Step 2: Run the test to verify the old binding fails**
+- [x] **Step 2: Run the test to verify the old binding fails**
 
 Run:
 
@@ -44,7 +44,7 @@ QT_QPA_PLATFORM=offscreen python3 -m unittest discover -v -s test -p 'test_*.py'
 
 Expected: import or binding assertion failure because `main_window.py` still uses PyQt5.
 
-- [ ] **Step 3: Migrate the window to PySide6**
+- [x] **Step 3: Migrate the window to PySide6**
 
 Use these imports and API forms:
 
@@ -71,7 +71,7 @@ install_requires=['setuptools', 'PySide6'],
 <exec_depend>python3</exec_depend>
 ```
 
-- [ ] **Step 4: Run all current UI tests**
+- [x] **Step 4: Run all current UI tests**
 
 Run:
 
@@ -81,7 +81,7 @@ QT_QPA_PLATFORM=offscreen python3 -m unittest discover -v -s test -p 'test_*.py'
 
 Expected: all tests pass under PySide6.
 
-- [ ] **Step 5: Compile and build the package**
+- [x] **Step 5: Compile and build the package**
 
 Run:
 
@@ -100,7 +100,7 @@ Expected: Python compilation succeeds and colcon reports `1 package finished`.
 - Modify: `openflex_gui/main_window.py`
 - Modify: `test/test_main_window_ui.py`
 
-- [ ] **Step 1: Write theme persistence tests**
+- [x] **Step 1: Write theme persistence tests**
 
 Add tests using a temporary INI-backed `QSettings`:
 
@@ -122,7 +122,7 @@ def test_theme_toggle_changes_window_palette_and_tooltip(self):
 Change the window constructor to `MainWindow(settings: QSettings | None = None)` and pass
 the temporary INI settings from `setUp`, so tests never modify real user settings.
 
-- [ ] **Step 2: Run the new tests and confirm failure**
+- [x] **Step 2: Run the new tests and confirm failure**
 
 Run:
 
@@ -132,7 +132,7 @@ QT_QPA_PLATFORM=offscreen python3 -m unittest discover -v -s test -p 'test_*.py'
 
 Expected: failure because `ThemeManager` and `btn_theme` do not exist.
 
-- [ ] **Step 3: Implement `ThemeManager`**
+- [x] **Step 3: Implement `ThemeManager`**
 
 Create a focused class:
 
@@ -157,7 +157,7 @@ class ThemeManager:
         return self.current_theme
 ```
 
-- [ ] **Step 4: Add the icon-only theme button and two complete palettes**
+- [x] **Step 4: Add the icon-only theme button and two complete palettes**
 
 Create `self.btn_theme` in the top bar with a fixed square size. Load
 `QIcon.fromTheme("weather-clear-night")` while in day mode and
@@ -167,7 +167,7 @@ tooltip to the full Chinese action. Refactor `_apply_theme()` to choose `DAY_COL
 `NIGHT_COLORS` and generate the same widget rules from palette values. Ensure the log
 remains dark in both themes for readability.
 
-- [ ] **Step 5: Run the theme tests**
+- [x] **Step 5: Run the theme tests**
 
 Run:
 
@@ -183,7 +183,7 @@ Expected: day default, night toggle, persistence, and all previous tests pass.
 - Modify: `openflex_gui/main_window.py`
 - Modify: `test/test_main_window_ui.py`
 
-- [ ] **Step 1: Write layout ownership tests**
+- [x] **Step 1: Write layout ownership tests**
 
 Assign object names `controlLeftColumn`, `vrCard`, and `runtimeLogCard`, then add:
 
@@ -202,7 +202,7 @@ def test_runtime_log_owns_the_full_right_column(self):
     self.assertEqual(log_card.sizePolicy().verticalPolicy(), QSizePolicy.Policy.Expanding)
 ```
 
-- [ ] **Step 2: Run tests and confirm the current layout fails**
+- [x] **Step 2: Run tests and confirm the current layout fails**
 
 Run:
 
@@ -212,7 +212,7 @@ QT_QPA_PLATFORM=offscreen python3 -m unittest discover -v -s test -p 'test_*.py'
 
 Expected: layout ownership tests fail because VR currently shares the right column with logs.
 
-- [ ] **Step 3: Move VR below the workflow**
+- [x] **Step 3: Move VR below the workflow**
 
 Build the control page as:
 
@@ -231,11 +231,11 @@ right_layout.addWidget(log_card, 1)
 
 The splitter contains only `left` and `right`. Keep the checkbox default checked and retain all existing signal connections.
 
-- [ ] **Step 4: Make diagnostics fill the right side**
+- [x] **Step 4: Make diagnostics fill the right side**
 
 Rename the log card object to `runtimeLogCard`, set an expanding size policy, remove the old minimum-height-only behavior, and keep the 3000-block limit.
 
-- [ ] **Step 5: Run all UI tests**
+- [x] **Step 5: Run all UI tests**
 
 Run:
 
@@ -251,7 +251,7 @@ Expected: all binding, theme, layout, process-independent, and legacy UI tests p
 - Modify only if verification exposes a defect: `openflex_gui/main_window.py`
 - Test: `test/test_main_window_ui.py`
 
-- [ ] **Step 1: Run static checks**
+- [x] **Step 1: Run static checks**
 
 Run:
 
@@ -262,7 +262,7 @@ git diff --check
 
 Expected: no syntax or whitespace errors.
 
-- [ ] **Step 2: Build and load the installed package**
+- [x] **Step 2: Build and load the installed package**
 
 Run:
 
@@ -276,15 +276,15 @@ QT_QPA_PLATFORM=offscreen python3 -c \
 
 Expected: build succeeds and the installed application prints `day` on a clean settings path.
 
-- [ ] **Step 3: Capture day and night screenshots**
+- [x] **Step 3: Capture day and night screenshots**
 
 Render the GUI at 1024x700 and 1360x820 in both modes. Verify that the VR card is below the startup workflow, diagnostics fills the right column, the theme button remains visible, text does not overlap, and both palettes have readable contrast.
 
-- [ ] **Step 4: Confirm backend command stability**
+- [x] **Step 4: Confirm backend command stability**
 
 Compare the command/process section beginning at `_on_enable_can` with its pre-phase version. Expected: ROS launch strings, CAN helpers, process-group shutdown, camera, lidar, battery, and VR argument behavior are unchanged.
 
-- [ ] **Step 5: Record the phase result**
+- [x] **Step 5: Record the phase result**
 
 Commit only the phase-one source, metadata, tests, and plan changes after all checks pass:
 

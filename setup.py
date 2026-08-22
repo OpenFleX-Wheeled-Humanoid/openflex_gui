@@ -10,8 +10,8 @@ setup(
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
     ],
-    package_data={package_name: ['*.sh', '*.svg']},
-    install_requires=['setuptools'],
+    package_data={package_name: ['*.sh', '*.svg', '*.png']},
+    install_requires=['setuptools', 'PySide6'],
     zip_safe=True,
     entry_points={
         'console_scripts': [

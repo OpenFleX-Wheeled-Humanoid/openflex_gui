@@ -15,16 +15,19 @@ import struct
 import time
 import threading
 
-from PyQt5.QtWidgets import (
+from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QLabel, QGroupBox, QSizePolicy, QFrame, QCheckBox,
-    QToolButton, QStyle
+    QToolButton, QStyle, QStackedWidget, QScrollArea, QSplitter
 )
-from PyQt5.QtCore import Qt, QProcess, QProcessEnvironment, pyqtSignal, QObject, QTimer
-from PyQt5.QtGui import QFont, QColor, QTextCursor
+from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, QSettings, Signal, QObject, QTimer
+from PySide6.QtGui import QFont, QColor, QTextCursor, QIcon
+
+from .theme_manager import ThemeManager
 
 # ─── 项目路径 ──────────────────────────────────────────────────────
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_ICON_FILE = os.path.join(_SCRIPT_DIR, 'openflex_vr.png')
 
 
 def _find_workspace_dir(start_dir: str) -> str:
@@ -83,9 +86,9 @@ ROBOT_CAN_CONFIG = {
 
 # ─── 信号桥（子线程 → GUI 线程）───────────────────────────────────
 class _Signals(QObject):
-    log = pyqtSignal(str)
-    log_html = pyqtSignal(str)
-    ui = pyqtSignal(object)
+    log = Signal(str)
+    log_html = Signal(str)
+    ui = Signal(object)
 
 
 # ─── 状态指示灯 Widget ────────────────────────────────────────────
@@ -100,25 +103,43 @@ class StatusDot(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedSize(16, 16)
+        self.status_label = None
+        self._state = 'idle'
+        self._state_texts = {
+            'idle': '待启动',
+            'running': '运行中',
+            'error': '异常',
+        }
         self.set_state('idle')
 
+    def bind_status_label(self, label: QLabel, state_texts: dict):
+        self.status_label = label
+        self._state_texts = state_texts
+        label.setText(state_texts.get(self._state, self._state))
+
     def set_state(self, state: str):
+        self._state = state
         c = self._COLORS.get(state, self._COLORS['idle'])
         self.setStyleSheet(
             f"background-color: {c}; border-radius: 8px; border: 1px solid #555;"
         )
+        if self.status_label is not None:
+            self.status_label.setText(self._state_texts.get(state, state))
 
 
 # ─── 主窗口 ──────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, settings: QSettings | None = None):
         super().__init__()
         self.setWindowTitle('OpenFlex VR 全身控制上位机')
-        self.setMinimumSize(800, 600)
+        self.setMinimumSize(1024, 700)
+        self.resize(1360, 820)
+        self.setWindowIcon(QIcon(_ICON_FILE))
         self._signals = _Signals()
         self._signals.log.connect(self._append_log)
         self._signals.log_html.connect(self._append_log_html)
         self._signals.ui.connect(self._run_ui_callback)
+        self.theme_manager = ThemeManager(settings)
 
         # 子进程管理
         self._proc_bringup: QProcess | None = None
@@ -134,144 +155,769 @@ class MainWindow(QMainWindow):
         self._auto_start_vr_max_attempts = 20
 
         self._build_ui()
+        self._apply_theme()
 
     # ── UI 构建 ──────────────────────────────────────────────────
     def _build_ui(self):
         central = QWidget()
+        central.setObjectName('appRoot')
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setSpacing(12)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        title = QLabel('OpenFlex VR 全身控制')
-        title.setFont(QFont('Sans', 18, QFont.Bold))
-        title.setAlignment(Qt.AlignCenter)
+        topbar = QFrame()
+        topbar.setObjectName('topBar')
+        topbar.setFixedHeight(60)
+        topbar_layout = QHBoxLayout(topbar)
+        topbar_layout.setContentsMargins(20, 0, 22, 0)
+        topbar_layout.setSpacing(10)
+        brand_icon = QLabel()
+        brand_icon.setObjectName('brandIcon')
+        brand_icon.setFixedSize(34, 34)
+        brand_icon.setAlignment(Qt.AlignCenter)
+        brand_icon.setPixmap(QIcon(_ICON_FILE).pixmap(28, 28))
+        title = QLabel('OpenFlex 控制中心')
+        title.setObjectName('appTitle')
+        title.setFont(QFont('Sans', 12, QFont.Bold))
+        health = QLabel('● 控制台就绪')
+        health.setObjectName('healthStatus')
+        platform = QLabel('ROS 2 · KCAN · 发售版')
+        platform.setObjectName('platformLabel')
+        self.btn_theme = QToolButton()
+        self.btn_theme.setObjectName('themeToggleButton')
+        self.btn_theme.setFixedSize(34, 34)
+        self.btn_theme.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self.btn_theme.clicked.connect(self._toggle_theme)
+        avatar = QLabel('OF')
+        avatar.setObjectName('avatar')
+        avatar.setAlignment(Qt.AlignCenter)
+        avatar.setFixedSize(28, 28)
+        topbar_layout.addWidget(brand_icon)
+        topbar_layout.addWidget(title)
+        topbar_layout.addStretch(1)
+        topbar_layout.addWidget(health)
+        topbar_layout.addSpacing(10)
+        topbar_layout.addWidget(platform)
+        topbar_layout.addWidget(self.btn_theme)
+        topbar_layout.addWidget(avatar)
+        root.addWidget(topbar)
+
+        body = QWidget()
+        body_layout = QHBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(0)
+        root.addWidget(body, 1)
+
+        sidebar = QFrame()
+        sidebar.setObjectName('sideBar')
+        sidebar.setFixedWidth(218)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(12, 18, 12, 18)
+        sidebar_layout.setSpacing(6)
+        workspace_label = QLabel('工作空间')
+        workspace_label.setObjectName('workspaceLabel')
+        sidebar_layout.addWidget(workspace_label)
+
+        self.nav_buttons = []
+        for index, text in enumerate(('整机控制', '传感器', '部署中心')):
+            button = QPushButton(text)
+            button.setObjectName('navButton')
+            button.setCheckable(True)
+            button.setMinimumHeight(38)
+            button.clicked.connect(lambda checked=False, page=index: self._set_page(page))
+            self.nav_buttons.append(button)
+            sidebar_layout.addWidget(button)
+        sidebar_layout.addStretch(1)
+        side_footer = QLabel('OpenFlex VR 全身控制上位机\nROS 后台进程统一管理')
+        side_footer.setObjectName('sideFooter')
+        side_footer.setWordWrap(True)
+        sidebar_layout.addWidget(side_footer)
+        body_layout.addWidget(sidebar)
+
+        self.page_stack = QStackedWidget()
+        self.page_stack.setObjectName('pageStack')
+        body_layout.addWidget(self.page_stack, 1)
+
+        self.page_stack.addWidget(self._scroll_page(self._build_control_page()))
+
+        self.page_stack.addWidget(self._scroll_page(self._build_sensors_page()))
+        self.page_stack.addWidget(self._scroll_page(self._build_deploy_page()))
+        self._set_page(0)
+
+        self._refresh_can_ui_state()
+
+    def _set_page(self, index: int):
+        self.page_stack.setCurrentIndex(index)
+        for button_index, button in enumerate(self.nav_buttons):
+            button.setChecked(button_index == index)
+
+    @staticmethod
+    def _scroll_page(page: QWidget) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setObjectName('pageScroll')
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(page)
+        return scroll
+
+    @staticmethod
+    def _placeholder_page(title: str, description: str) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(28, 26, 28, 28)
+        heading = QLabel(title)
+        heading.setFont(QFont('Sans', 18, QFont.Bold))
+        layout.addWidget(heading)
+        layout.addWidget(QLabel(description))
+        layout.addStretch(1)
+        return page
+
+    def _apply_theme(self):
+        stylesheet = """
+            QMainWindow, QWidget#appRoot {
+                background: #eef2f7;
+                color: #1b2839;
+                font-family: "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+                font-size: 12px;
+            }
+            QFrame#topBar {
+                background: #ffffff;
+                border-bottom: 1px solid #d4deea;
+            }
+            QLabel#brandIcon {
+                background: #ffffff;
+                border: 1px solid #d4deea;
+                border-radius: 6px;
+            }
+            QLabel#appTitle {
+                color: #1b2839;
+                font-size: 16px;
+                font-weight: 700;
+            }
+            QLabel#healthStatus {
+                color: #16836e;
+                font-size: 11px;
+                font-weight: 700;
+            }
+            QLabel#platformLabel, QLabel#sideFooter, QLabel#pageSubtitle,
+            QLabel#panelCopy, QLabel#cardCopy, QLabel#controlStepCopy {
+                color: #708096;
+            }
+            QLabel#avatar {
+                background: #e7edf7;
+                color: #34527f;
+                border-radius: 14px;
+                font-size: 10px;
+                font-weight: 700;
+            }
+            QToolButton#themeToggleButton {
+                background: transparent;
+                color: #53647a;
+                border: 1px solid #d4deea;
+                border-radius: 5px;
+                font-size: 17px;
+                font-weight: 600;
+            }
+            QToolButton#themeToggleButton:hover {
+                background: #f2f5fa;
+            }
+            QFrame#sideBar {
+                background: #ffffff;
+                border-right: 1px solid #d4deea;
+            }
+            QLabel#workspaceLabel {
+                color: #8592a4;
+                font-size: 10px;
+                font-weight: 700;
+                padding: 0 8px 6px 8px;
+            }
+            QLabel#sideFooter {
+                font-size: 10px;
+                line-height: 1.5;
+                padding: 10px 8px;
+            }
+            QPushButton#navButton {
+                background: transparent;
+                color: #607087;
+                border: none;
+                border-radius: 5px;
+                text-align: left;
+                padding-left: 14px;
+                font-weight: 500;
+            }
+            QPushButton#navButton:hover {
+                background: #f2f5fa;
+            }
+            QPushButton#navButton:checked {
+                background: #e8efff;
+                color: #1751c6;
+                font-weight: 700;
+            }
+            QStackedWidget#pageStack, QScrollArea#pageScroll,
+            QScrollArea#pageScroll > QWidget > QWidget {
+                background: #eef2f7;
+                border: none;
+            }
+            QLabel#pageTitle {
+                color: #1b2839;
+                font-size: 27px;
+                font-weight: 700;
+            }
+            QFrame#controlWorkflow, QFrame#vrCard, QFrame#sensorCard,
+            QFrame#deployPlaceholder {
+                background: #ffffff;
+                border: 1px solid #d4deea;
+                border-radius: 7px;
+            }
+            QFrame#panelHeader {
+                background: #ffffff;
+                border: none;
+                border-bottom: 1px solid #dbe5f1;
+            }
+            QFrame#controlStep {
+                background: #ffffff;
+                border: none;
+                border-bottom: 1px solid #dbe5f1;
+            }
+            QFrame#controlStep[primaryStep="true"] {
+                background: #f7faff;
+            }
+            QLabel#panelTitle, QLabel#cardTitle, QLabel#logTitle {
+                color: #1b2839;
+                font-size: 15px;
+                font-weight: 700;
+            }
+            QLabel#kicker {
+                color: #7358a5;
+                font-size: 10px;
+                font-weight: 700;
+            }
+            QLabel#stepNumber {
+                background: #e8efff;
+                color: #1751c6;
+                border-radius: 15px;
+                font-weight: 700;
+            }
+            QPushButton {
+                min-height: 34px;
+                padding: 0 12px;
+                background: #ffffff;
+                color: #41526a;
+                border: 1px solid #d4deea;
+                border-radius: 5px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: #f2f5fa;
+            }
+            QPushButton:disabled, QToolButton:disabled {
+                color: #a0acbb;
+                background: #eef1f5;
+                border-color: #dce3eb;
+            }
+            QPushButton[variant="primary"] {
+                background: #1e5bd3;
+                color: #ffffff;
+                border-color: #1e5bd3;
+            }
+            QPushButton[variant="primary"]:hover {
+                background: #174fb9;
+            }
+            QPushButton[variant="danger"], QToolButton[variant="danger"] {
+                background: #f6e6e6;
+                color: #ad3838;
+                border: 1px solid #eed3d3;
+                border-radius: 5px;
+            }
+            QPushButton[variant="text"] {
+                background: transparent;
+                border: none;
+                color: #8fa4bb;
+                padding: 0 5px;
+            }
+            QPushButton[variant="primary"]:disabled,
+            QPushButton[variant="danger"]:disabled,
+            QPushButton[variant="secondary"]:disabled,
+            QToolButton[variant="danger"]:disabled {
+                color: #a0acbb;
+                background: #eef1f5;
+                border-color: #dce3eb;
+            }
+            QCheckBox {
+                color: #53647a;
+                spacing: 7px;
+            }
+            QFrame#runtimeLogCard {
+                background: #172235;
+                border: 1px solid #263750;
+                border-radius: 7px;
+            }
+            QFrame#runtimeLogCard QLabel#logTitle {
+                color: #f2f6fb;
+            }
+            QTextEdit#runtimeLog {
+                background: #172235;
+                color: #70dca5;
+                border: none;
+                selection-background-color: #31527e;
+            }
+            QSplitter::handle {
+                background: transparent;
+                width: 12px;
+            }
+            QScrollBar:vertical {
+                width: 10px;
+                background: #e7edf4;
+                border: none;
+            }
+            QScrollBar::handle:vertical {
+                min-height: 28px;
+                background: #aebccd;
+                border-radius: 5px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
+            }
+        """
+        if self.theme_manager.current_theme == 'night':
+            stylesheet += """
+                QMainWindow, QWidget#appRoot {
+                    background: #111827;
+                    color: #e7edf5;
+                }
+                QFrame#topBar, QFrame#sideBar,
+                QFrame#controlWorkflow, QFrame#vrCard, QFrame#sensorCard,
+                QFrame#deployPlaceholder, QFrame#panelHeader,
+                QFrame#controlStep, QFrame#controlStep[primaryStep="true"] {
+                    background: #182235;
+                    border-color: #2c3a4f;
+                }
+                QFrame#topBar {
+                    border-bottom-color: #2c3a4f;
+                }
+                QFrame#sideBar {
+                    border-right-color: #2c3a4f;
+                }
+                QFrame#panelHeader, QFrame#controlStep {
+                    border-bottom-color: #2c3a4f;
+                }
+                QLabel#brandIcon {
+                    background: #202c40;
+                    border-color: #38485f;
+                }
+                QLabel#appTitle, QLabel#pageTitle, QLabel#panelTitle,
+                QLabel#cardTitle, QLabel#controlStepTitle, QLabel#statusText {
+                    color: #edf3fa;
+                }
+                QFrame#runtimeLogCard QLabel#logTitle {
+                    color: #f2f6fb;
+                }
+                QLabel#platformLabel, QLabel#sideFooter, QLabel#pageSubtitle,
+                QLabel#panelCopy, QLabel#cardCopy, QLabel#controlStepCopy,
+                QCheckBox {
+                    color: #9eacc0;
+                }
+                QLabel#workspaceLabel {
+                    color: #8290a5;
+                }
+                QLabel#avatar {
+                    background: #29364b;
+                    color: #c9d7ea;
+                }
+                QPushButton#navButton {
+                    color: #aab7c9;
+                }
+                QPushButton#navButton:hover {
+                    background: #202c40;
+                }
+                QPushButton#navButton:checked {
+                    background: #20385f;
+                    color: #8eb5ff;
+                }
+                QStackedWidget#pageStack, QScrollArea#pageScroll,
+                QScrollArea#pageScroll > QWidget > QWidget {
+                    background: #111827;
+                }
+                QLabel#stepNumber {
+                    background: #233c65;
+                    color: #a8c6ff;
+                }
+                QPushButton, QToolButton#themeToggleButton {
+                    background: #202c40;
+                    color: #d9e3ef;
+                    border-color: #3a4a61;
+                }
+                QPushButton:hover, QToolButton#themeToggleButton:hover {
+                    background: #29374d;
+                }
+                QPushButton:disabled, QToolButton:disabled {
+                    color: #657287;
+                    background: #192233;
+                    border-color: #2b374a;
+                }
+                QPushButton[variant="primary"] {
+                    background: #3574e8;
+                    border-color: #3574e8;
+                    color: #ffffff;
+                }
+                QPushButton[variant="primary"]:hover {
+                    background: #2866d5;
+                }
+                QPushButton[variant="danger"], QToolButton[variant="danger"] {
+                    background: #46282f;
+                    color: #ffb4b4;
+                    border-color: #69404a;
+                }
+                QPushButton[variant="text"] {
+                    background: transparent;
+                    color: #9eb0c7;
+                    border: none;
+                }
+                QScrollBar:vertical {
+                    background: #182235;
+                }
+                QScrollBar::handle:vertical {
+                    background: #53627a;
+                }
+            """
+        self.setStyleSheet(stylesheet)
+        self._update_theme_button()
+
+    def _toggle_theme(self):
+        self.theme_manager.toggle()
+        self._apply_theme()
+
+    def _update_theme_button(self):
+        switching_to_night = self.theme_manager.current_theme == 'day'
+        self.btn_theme.setIcon(QIcon())
+        self.btn_theme.setText('☾' if switching_to_night else '☀')
+        self.btn_theme.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.btn_theme.setToolTip(
+            '切换到夜间模式' if switching_to_night else '切换到日间模式'
+        )
+
+    def _build_control_page(self) -> QWidget:
+        page = QWidget()
+        page.setObjectName('controlPage')
+        root = QVBoxLayout(page)
+        root.setContentsMargins(28, 24, 28, 28)
+        root.setSpacing(18)
+
+        title = QLabel('整机控制')
+        title.setObjectName('pageTitle')
+        title.setFont(QFont('Sans', 22, QFont.Bold))
+        subtitle = QLabel('按启动顺序完成 CAN、执行器检查，再启动整机控制。')
+        subtitle.setObjectName('pageSubtitle')
         root.addWidget(title)
+        root.addWidget(subtitle)
 
-        # --- 1. CAN 总线 ---
-        grp_can = QGroupBox('1. CAN 总线')
-        h1 = QHBoxLayout(grp_can)
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        root.addWidget(splitter, 1)
+
+        workflow = QFrame()
+        workflow.setObjectName('controlWorkflow')
+        workflow.setMinimumWidth(430)
+        workflow_layout = QVBoxLayout(workflow)
+        workflow_layout.setContentsMargins(0, 0, 0, 0)
+        workflow_layout.setSpacing(0)
+
+        workflow_header = QFrame()
+        workflow_header.setObjectName('panelHeader')
+        workflow_header_layout = QVBoxLayout(workflow_header)
+        workflow_header_layout.setContentsMargins(20, 17, 20, 16)
+        workflow_header_layout.setSpacing(5)
+        workflow_title = QLabel('整机控制')
+        workflow_title.setObjectName('panelTitle')
+        workflow_title.setFont(QFont('Sans', 15, QFont.Bold))
+        workflow_copy = QLabel('按顺序准备底层接口、执行器和控制器')
+        workflow_copy.setObjectName('panelCopy')
+        workflow_header_layout.addWidget(workflow_title)
+        workflow_header_layout.addWidget(workflow_copy)
+        workflow_layout.addWidget(workflow_header)
+
         self.dot_can = StatusDot()
-        self.btn_enable_can = QPushButton('启用全部 CAN')
-        self.btn_enable_can.setMinimumHeight(40)
+        self.btn_enable_can = self._button('启用全部 CAN', 'primary')
         self.btn_enable_can.clicked.connect(self._on_enable_can)
-        self.btn_disable_can = QPushButton('禁用全部 CAN')
-        self.btn_disable_can.setMinimumHeight(40)
+        self.btn_disable_can = self._button('禁用全部', 'danger')
         self.btn_disable_can.clicked.connect(self._on_disable_can)
-        h1.addWidget(self.dot_can)
-        h1.addWidget(self.btn_enable_can, 1)
-        h1.addWidget(self.btn_disable_can, 1)
-        root.addWidget(grp_can)
+        workflow_layout.addWidget(self._build_control_step(
+            '1', 'CAN 总线', '先启用并确认 can0–can5 接口', self.dot_can,
+            (self.btn_enable_can, self.btn_disable_can),
+            {'idle': '待启动', 'running': '通道在线', 'error': '接口异常'},
+        ))
 
-        # --- 2. 电机状态 ---
-        grp_status = QGroupBox('2. 电机状态')
-        h2 = QHBoxLayout(grp_status)
         self.dot_status = StatusDot()
-        self.btn_status = QPushButton('检查全部电机状态')
-        self.btn_status.setMinimumHeight(40)
+        self.btn_status = self._button('检查全部状态', 'secondary')
         self.btn_status.clicked.connect(self._on_check_status)
-        h2.addWidget(self.dot_status)
-        h2.addWidget(self.btn_status, 1)
-        root.addWidget(grp_status)
+        workflow_layout.addWidget(self._build_control_step(
+            '2', '电机状态', '检查全部控制器、节点和电机反馈', self.dot_status,
+            (self.btn_status,),
+            {'idle': '待检查', 'running': '检查中', 'error': '状态异常'},
+        ))
 
-        # --- 3. 整机控制 ---
-        grp_bringup = QGroupBox('3. 整机控制 (ros2 launch)')
-        h3 = QHBoxLayout(grp_bringup)
         self.dot_bringup = StatusDot()
-        self.btn_bringup_start = QPushButton('启动整机控制')
-        self.btn_bringup_start.setMinimumHeight(40)
+        self.btn_bringup_start = self._button('启动整机控制', 'primary')
         self.btn_bringup_start.clicked.connect(self._on_start_bringup)
-        self.btn_bringup_stop = QPushButton('停止')
-        self.btn_bringup_stop.setMinimumHeight(40)
-        self.btn_bringup_stop.setFixedWidth(80)
+        self.btn_bringup_stop = self._button('停止整机', 'danger')
         self.btn_bringup_stop.setEnabled(False)
         self.btn_bringup_stop.clicked.connect(self._on_stop_bringup)
-        h3.addWidget(self.dot_bringup)
-        h3.addWidget(self.btn_bringup_start, 1)
-        h3.addWidget(self.btn_bringup_stop)
-        root.addWidget(grp_bringup)
+        workflow_layout.addWidget(self._build_control_step(
+            '3', '启动整机控制', '加载全部控制器并进入可操作状态', self.dot_bringup,
+            (self.btn_bringup_start, self.btn_bringup_stop),
+            {'idle': '待启动', 'running': '运行中', 'error': '启动异常'},
+            primary=True,
+        ))
+        workflow_layout.addStretch(1)
 
-        # --- 4. VR 遥操作 ---
-        grp_vr = QGroupBox('4. VR 遥操作 (ros2 launch)')
-        h4 = QHBoxLayout(grp_vr)
+        left_column = QFrame()
+        left_column.setObjectName('controlLeftColumn')
+        left_column.setMinimumWidth(430)
+        left_column_layout = QVBoxLayout(left_column)
+        left_column_layout.setContentsMargins(0, 0, 0, 0)
+        left_column_layout.setSpacing(12)
+        left_column_layout.addWidget(workflow, 1)
+
+        right_column = QFrame()
+        right_column.setObjectName('controlRightColumn')
+        right_column.setMinimumWidth(280)
+        right_column_layout = QVBoxLayout(right_column)
+        right_column_layout.setContentsMargins(0, 0, 0, 0)
+        right_column_layout.setSpacing(0)
+
+        vr_card = QFrame()
+        vr_card.setObjectName('vrCard')
+        vr_layout = QVBoxLayout(vr_card)
+        vr_layout.setContentsMargins(18, 17, 18, 18)
+        vr_layout.setSpacing(9)
+        vr_kicker = QLabel('OPENXR')
+        vr_kicker.setObjectName('kicker')
+        vr_title = QLabel('VR 遥操作')
+        vr_title.setObjectName('cardTitle')
+        vr_copy = QLabel('启动 VR 控制，并选择是否接收底盘速度。')
+        vr_copy.setObjectName('cardCopy')
+        vr_copy.setWordWrap(True)
         self.dot_vr = StatusDot()
-        self.btn_vr_start = QPushButton('启动 VR 遥操作')
-        self.btn_vr_start.setMinimumHeight(40)
-        self.btn_vr_start.clicked.connect(self._on_start_vr)
-        self.chk_vr_chassis = QCheckBox('vr控制底盘速度')
+        vr_status_row = QHBoxLayout()
+        vr_status = QLabel()
+        vr_status.setObjectName('statusText')
+        self.dot_vr.bind_status_label(vr_status, {
+            'idle': '设备待启动',
+            'running': '运行中',
+            'error': '连接异常',
+        })
+        vr_status_row.addWidget(self.dot_vr)
+        vr_status_row.addWidget(vr_status)
+        vr_status_row.addStretch(1)
+        self.chk_vr_chassis = QCheckBox('VR 控制底盘速度')
+        self.chk_vr_chassis.setChecked(True)
         self.chk_vr_chassis.setToolTip('勾选后使用 VR 发来的底盘线速度/角速度上限')
-        self.btn_vr_stop = QPushButton('停止')
-        self.btn_vr_stop.setMinimumHeight(40)
-        self.btn_vr_stop.setFixedWidth(80)
+        self.btn_vr_start = self._button('启动 VR', 'primary')
+        self.btn_vr_start.clicked.connect(self._on_start_vr)
+        self.btn_vr_stop = self._button('停止', 'secondary')
         self.btn_vr_stop.setEnabled(False)
         self.btn_vr_stop.clicked.connect(self._on_stop_vr)
-        h4.addWidget(self.dot_vr)
-        h4.addWidget(self.btn_vr_start, 1)
-        h4.addWidget(self.chk_vr_chassis)
-        h4.addWidget(self.btn_vr_stop)
-        root.addWidget(grp_vr)
+        vr_actions = QHBoxLayout()
+        vr_actions.addWidget(self.btn_vr_start)
+        vr_actions.addWidget(self.btn_vr_stop)
+        vr_actions.addStretch(1)
+        vr_layout.addWidget(vr_kicker)
+        vr_layout.addWidget(vr_title)
+        vr_layout.addWidget(vr_copy)
+        vr_layout.addLayout(vr_status_row)
+        vr_layout.addWidget(self.chk_vr_chassis)
+        vr_layout.addLayout(vr_actions)
+        left_column_layout.addWidget(vr_card)
 
-        # --- 5. 传感器检测 (Ultra版) ---
-        grp_sensors = QGroupBox('5. 传感器检测 (Ultra版)')
-        h6 = QHBoxLayout(grp_sensors)
+        log_card = QFrame()
+        log_card.setObjectName('runtimeLogCard')
+        log_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        log_layout = QVBoxLayout(log_card)
+        log_layout.setContentsMargins(15, 14, 15, 15)
+        log_header = QHBoxLayout()
+        log_title = QLabel('运行诊断')
+        log_title.setObjectName('logTitle')
+        log_title.setMinimumWidth(72)
+        btn_clear = self._button('清空', 'text')
+        log_header.addWidget(log_title)
+        log_header.addStretch(1)
+        log_header.addWidget(btn_clear)
+        self.log_view = QTextEdit()
+        self.log_view.setObjectName('runtimeLog')
+        self.log_view.setReadOnly(True)
+        self.log_view.document().setMaximumBlockCount(3000)
+        self.log_view.setFont(QFont('Monospace', 9))
+        self.log_view.setTextColor(QColor('#70dca5'))
+        self.log_view.setMinimumHeight(220)
+        btn_clear.clicked.connect(self.log_view.clear)
+        log_layout.addLayout(log_header)
+        log_layout.addWidget(self.log_view, 1)
+        right_column_layout.addWidget(log_card, 1)
+        splitter.addWidget(left_column)
+        splitter.addWidget(right_column)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        return page
 
-        self.btn_camera_ros = QPushButton('相机查看 (RealSense ROS2)')
-        self.btn_camera_ros.setMinimumHeight(40)
+    def _build_sensors_page(self) -> QWidget:
+        page = QWidget()
+        page.setObjectName('sensorsPage')
+        root = QVBoxLayout(page)
+        root.setContentsMargins(28, 24, 28, 28)
+        root.setSpacing(16)
+
+        title = QLabel('传感器')
+        title.setObjectName('pageTitle')
+        title.setFont(QFont('Sans', 22, QFont.Bold))
+        subtitle = QLabel('查看 RealSense 相机和 Livox MID360S 激光雷达。')
+        subtitle.setObjectName('pageSubtitle')
+        root.addWidget(title)
+        root.addWidget(subtitle)
+
+        camera_card = QFrame()
+        camera_card.setObjectName('sensorCard')
+        camera_layout = QVBoxLayout(camera_card)
+        camera_layout.setContentsMargins(20, 18, 20, 20)
+        camera_layout.setSpacing(10)
+        camera_title = QLabel('RealSense 相机')
+        camera_title.setObjectName('cardTitle')
+        camera_copy = QLabel('启动四路 RGB ROS2/RViz2 视图，或打开独立 RealSense Viewer。')
+        camera_copy.setObjectName('cardCopy')
+        camera_copy.setWordWrap(True)
+        camera_actions = QHBoxLayout()
+        camera_actions.setSpacing(8)
+        self.btn_camera_ros = self._button('相机查看 · ROS2', 'primary')
         self.btn_camera_ros.setToolTip('启动四路 RGB 相机并在 RViz2 中显示')
         self.btn_camera_ros.clicked.connect(self._on_start_camera_ros)
-        h6.addWidget(self.btn_camera_ros, 1)
-
-        self.btn_camera = QPushButton('相机查看 (RealSense Viewer)')
-        self.btn_camera.setMinimumHeight(40)
+        self.btn_camera = self._button('相机查看 · Viewer', 'secondary')
         self.btn_camera.clicked.connect(self._on_start_camera_viewer)
-        h6.addWidget(self.btn_camera, 1)
-
         self.btn_camera_stop = QToolButton()
+        self.btn_camera_stop.setProperty('variant', 'danger')
         self.btn_camera_stop.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
         self.btn_camera_stop.setFixedSize(40, 40)
         self.btn_camera_stop.setToolTip('停止当前 RealSense 相机查看')
         self.btn_camera_stop.setEnabled(False)
         self.btn_camera_stop.clicked.connect(self._on_stop_camera_viewer)
-        h6.addWidget(self.btn_camera_stop)
+        camera_actions.addWidget(self.btn_camera_ros)
+        camera_actions.addWidget(self.btn_camera)
+        camera_actions.addWidget(self.btn_camera_stop)
+        camera_actions.addStretch(1)
+        camera_layout.addWidget(camera_title)
+        camera_layout.addWidget(camera_copy)
+        camera_layout.addLayout(camera_actions)
+        root.addWidget(camera_card)
 
-        # 添加分隔线
-        separator = QFrame()
-        separator.setFrameShape(QFrame.VLine)
-        separator.setFrameShadow(QFrame.Sunken)
-        h6.addWidget(separator)
-
-        # 激光雷达查看器按钮和停止按钮
-        self.btn_lidar = QPushButton('激光雷达查看器 (Livox MID360s)')
-        self.btn_lidar.setMinimumHeight(40)
+        lidar_card = QFrame()
+        lidar_card.setObjectName('sensorCard')
+        lidar_layout = QVBoxLayout(lidar_card)
+        lidar_layout.setContentsMargins(20, 18, 20, 20)
+        lidar_layout.setSpacing(10)
+        lidar_title = QLabel('Livox MID360S')
+        lidar_title.setObjectName('cardTitle')
+        lidar_copy = QLabel('启动 Livox ROS2 驱动并打开对应 RViz2 配置。')
+        lidar_copy.setObjectName('cardCopy')
+        lidar_actions = QHBoxLayout()
+        lidar_actions.setSpacing(8)
+        self.btn_lidar = self._button('启动激光雷达查看器', 'primary')
         self.btn_lidar.clicked.connect(self._on_start_lidar_viewer)
-        h6.addWidget(self.btn_lidar, 1)
-
-        self.btn_lidar_stop = QPushButton('停止')
-        self.btn_lidar_stop.setMinimumHeight(40)
-        self.btn_lidar_stop.setFixedWidth(80)
+        self.btn_lidar_stop = self._button('停止', 'danger')
         self.btn_lidar_stop.setEnabled(False)
         self.btn_lidar_stop.clicked.connect(self._on_stop_lidar_viewer)
-        h6.addWidget(self.btn_lidar_stop)
+        lidar_actions.addWidget(self.btn_lidar)
+        lidar_actions.addWidget(self.btn_lidar_stop)
+        lidar_actions.addStretch(1)
+        lidar_layout.addWidget(lidar_title)
+        lidar_layout.addWidget(lidar_copy)
+        lidar_layout.addLayout(lidar_actions)
+        root.addWidget(lidar_card)
+        root.addStretch(1)
+        return page
 
-        root.addWidget(grp_sensors)
+    @staticmethod
+    def _build_deploy_page() -> QWidget:
+        page = QWidget()
+        page.setObjectName('deployPage')
+        root = QVBoxLayout(page)
+        root.setContentsMargins(28, 24, 28, 28)
+        root.setSpacing(16)
+        title = QLabel('部署中心')
+        title.setObjectName('pageTitle')
+        title.setFont(QFont('Sans', 22, QFont.Bold))
+        subtitle = QLabel('管理 OpenFlex 驱动安装和 ROS 2 工作区构建入口。')
+        subtitle.setObjectName('pageSubtitle')
+        placeholder = QFrame()
+        placeholder.setObjectName('deployPlaceholder')
+        placeholder_layout = QVBoxLayout(placeholder)
+        placeholder_layout.setContentsMargins(22, 20, 22, 22)
+        heading = QLabel('部署功能尚未接入')
+        heading.setObjectName('cardTitle')
+        copy = QLabel('基础面板仅保留页面位置。接入安装脚本前，不提供可能误触发系统变更的操作按钮。')
+        copy.setObjectName('cardCopy')
+        copy.setWordWrap(True)
+        placeholder_layout.addWidget(heading)
+        placeholder_layout.addWidget(copy)
+        root.addWidget(title)
+        root.addWidget(subtitle)
+        root.addWidget(placeholder)
+        root.addStretch(1)
+        return page
 
-        # --- 日志 ---
-        log_label = QLabel('日志输出:')
-        log_label.setFont(QFont('Sans', 10, QFont.Bold))
-        root.addWidget(log_label)
+    @staticmethod
+    def _button(text: str, variant: str) -> QPushButton:
+        button = QPushButton(text)
+        button.setProperty('variant', variant)
+        button.setMinimumHeight(36)
+        return button
 
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setFont(QFont('Monospace', 9))
-        self.log_view.setTextColor(QColor('#2ecc71'))
-        self.log_view.setMinimumHeight(180)
-        root.addWidget(self.log_view, 1)
+    @staticmethod
+    def _build_control_step(number: str, title: str, description: str,
+                            dot: StatusDot, buttons: tuple,
+                            state_texts: dict,
+                            primary: bool = False) -> QFrame:
+        step = QFrame()
+        step.setObjectName('controlStep')
+        step.setProperty('primaryStep', primary)
+        step.setMinimumHeight(116)
+        layout = QHBoxLayout(step)
+        layout.setContentsMargins(20, 15, 20, 15)
+        layout.setSpacing(14)
 
-        # 清空日志按钮
-        btn_clear = QPushButton('清空日志')
-        btn_clear.clicked.connect(self.log_view.clear)
-        root.addWidget(btn_clear)
+        number_label = QLabel(number)
+        number_label.setObjectName('stepNumber')
+        number_label.setAlignment(Qt.AlignCenter)
+        number_label.setFixedSize(30, 30)
+        layout.addWidget(number_label, 0, Qt.AlignTop)
 
-        self._refresh_can_ui_state()
+        copy_layout = QVBoxLayout()
+        copy_layout.setSpacing(4)
+        title_label = QLabel(title)
+        title_label.setObjectName('controlStepTitle')
+        title_label.setFont(QFont('Sans', 11, QFont.Bold))
+        description_label = QLabel(description)
+        description_label.setObjectName('controlStepCopy')
+        description_label.setWordWrap(True)
+        status_layout = QHBoxLayout()
+        status_layout.setSpacing(6)
+        status_label = QLabel()
+        status_label.setObjectName('statusText')
+        dot.bind_status_label(status_label, state_texts)
+        status_layout.addWidget(dot)
+        status_layout.addWidget(status_label)
+        status_layout.addStretch(1)
+        copy_layout.addWidget(title_label)
+        copy_layout.addWidget(description_label)
+        copy_layout.addLayout(status_layout)
+        layout.addLayout(copy_layout, 1)
+
+        actions = QVBoxLayout()
+        actions.setSpacing(6)
+        for button in buttons:
+            button.setMinimumWidth(142)
+            actions.addWidget(button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        return step
 
     # ── 日志 ─────────────────────────────────────────────────────
     def _append_log(self, text: str):
@@ -1095,7 +1741,7 @@ def main():
     app.setStyle('Fusion')
     win = MainWindow()
     win.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 
 if __name__ == '__main__':
