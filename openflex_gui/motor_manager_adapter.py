@@ -11,6 +11,7 @@ class MotorManagerAdapter:
         self.page: QWidget | None = None
         self.controller = None
         self.is_shutdown = False
+        self._theme = "day"
         self._validate_manager_dir()
 
     def _validate_manager_dir(self) -> None:
@@ -38,7 +39,8 @@ class MotorManagerAdapter:
 
         from ui import MotorManagementPage
 
-        self.page = MotorManagementPage()
+        manager_theme = "light" if self._theme == "day" else "dark"
+        self.page = MotorManagementPage(initial_theme=manager_theme)
         return self.page
 
     def initialize_controller(self):
@@ -62,6 +64,7 @@ class MotorManagerAdapter:
     def set_theme(self, theme: str) -> None:
         if theme not in {"day", "night"}:
             raise ValueError(f"unsupported control-center theme: {theme}")
+        self._theme = theme
         if self.page is not None:
             self.page.apply_theme("light" if theme == "day" else "dark")
 

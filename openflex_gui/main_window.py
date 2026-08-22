@@ -301,8 +301,8 @@ class MainWindow(QMainWindow):
         )
         try:
             adapter = self._motor_adapter_factory(manager_dir)
-            page = adapter.create_page()
             adapter.set_theme(self.theme_manager.current_theme)
+            page = adapter.create_page()
             if hasattr(page, 'btn_theme_toggle'):
                 page.btn_theme_toggle.hide()
             self.motor_manager_adapter = adapter

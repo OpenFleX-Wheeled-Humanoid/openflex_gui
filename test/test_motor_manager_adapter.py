@@ -64,6 +64,17 @@ class MotorManagerAdapterTest(unittest.TestCase):
         self.assertTrue(adapter.is_shutdown)
         self.assertEqual(controller.shutdown_calls, 1)
 
+    def test_theme_set_before_page_creation_is_applied_immediately(self):
+        module = importlib.import_module("openflex_gui.motor_manager_adapter")
+        manager_dir = Path(__file__).resolve().parents[2] / "openflex_manager"
+        adapter = module.MotorManagerAdapter(manager_dir)
+
+        adapter.set_theme("day")
+        page = adapter.create_page()
+
+        self.assertEqual(page.current_theme, "light")
+        adapter.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()
