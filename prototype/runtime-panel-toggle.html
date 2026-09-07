@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenFlex 控制中心 · 运行诊断与整机模型</title>
+  <style>
+    :root {
+      --app-bg: #eef2f7;
+      --surface: #ffffff;
+      --surface-soft: #f7f9fb;
+      --line: #d6e0e8;
+      --line-strong: #bdccd7;
+      --ink: #1b2839;
+      --muted: #687889;
+      --muted-2: #8b9aa8;
+      --teal: #0d7a78;
+      --teal-soft: #e4f3f1;
+      --diag: #70dca5;
+      --hot: #f0c45a;
+      --danger: #ec7167;
+      --panel-dark: #12242b;
+      --panel-dark-2: #18343a;
+      --shadow: 0 14px 35px rgba(30, 53, 71, .07);
+      --radius: 8px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--app-bg);
+      color: var(--ink);
+      font-family: "Noto Sans CJK SC", "Microsoft YaHei", system-ui, sans-serif;
+      font-size: 13px;
+    }
+
+    button { font: inherit; }
+
+    .app-shell {
+      width: min(1440px, 100%);
+      min-height: 100vh;
+      margin: 0 auto;
+      background: var(--app-bg);
+    }
+
+    .topbar {
+      height: 60px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 22px 0 20px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .brand-mark {
+      width: 34px;
+      height: 34px;
+      display: grid;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--teal);
+      font-weight: 800;
+      letter-spacing: 0;
+    }
+
+    .topbar h1 { margin: 0; font-size: 15px; font-weight: 750; letter-spacing: 0; }
+    .topbar-spacer { flex: 1; }
+    .ready { color: #377a62; font-size: 12px; font-weight: 650; }
+    .platform { color: var(--muted); font-size: 12px; padding-left: 8px; border-left: 1px solid var(--line); }
+    .avatar { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 50%; background: #d9eceb; color: #286a69; font-weight: 800; font-size: 11px; }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: 218px minmax(0, 1fr);
+      min-height: calc(100vh - 60px);
+    }
+
+    .sidebar {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      padding: 20px 12px 18px;
+      background: #f6f8fa;
+      border-right: 1px solid var(--line);
+    }
+
+    .sidebar-label { margin: 0 8px 7px; color: var(--muted-2); font-size: 11px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+    .nav-item { border: 0; border-radius: 6px; padding: 11px 12px; text-align: left; color: var(--muted); background: transparent; cursor: default; }
+    .nav-item.active { color: var(--teal); background: var(--teal-soft); font-weight: 750; }
+    .sidebar-footer { margin-top: auto; padding: 10px 8px 0; color: var(--muted-2); font-size: 11px; line-height: 1.65; }
+
+    main { min-width: 0; padding: 25px 28px 30px; }
+    .page-heading { margin-bottom: 18px; }
+    .page-heading h2 { margin: 0 0 6px; font-size: 24px; line-height: 1.2; letter-spacing: 0; }
+    .page-heading p { margin: 0; color: var(--muted); line-height: 1.6; }
+
+    .control-grid {
+      display: grid;
+      grid-template-columns: minmax(420px, 2fr) minmax(360px, 3fr);
+      gap: 18px;
+      align-items: stretch;
+    }
+
+    .workflow, .runtime-panel { min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+    .workflow { overflow: hidden; }
+    .panel-heading { padding: 18px 20px 16px; border-bottom: 1px solid var(--line); }
+    .panel-heading h3 { margin: 0 0 5px; font-size: 15px; }
+    .panel-heading p { margin: 0; color: var(--muted); font-size: 12px; }
+
+    .step { display: grid; grid-template-columns: 31px minmax(0, 1fr); gap: 12px; padding: 17px 20px; border-bottom: 1px solid #e6edf2; }
+    .step:last-child { border-bottom: 0; }
+    .step-no { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 50%; background: #eff4f6; color: var(--teal); font-weight: 800; font-size: 12px; }
+    .step-copy { min-width: 0; }
+    .step-title { display: flex; align-items: center; gap: 8px; margin-bottom: 3px; font-weight: 750; }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--diag); box-shadow: 0 0 0 3px rgba(112,220,165,.15); }
+    .status-dot.idle { background: var(--muted-2); box-shadow: none; }
+    .step-copy p { margin: 0 0 12px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .button-row { display: flex; flex-wrap: wrap; gap: 7px; }
+    .button { border: 1px solid var(--line-strong); border-radius: 6px; padding: 8px 11px; background: var(--surface); color: var(--ink); font-size: 12px; font-weight: 700; cursor: default; }
+    .button.primary { border-color: var(--teal); background: var(--teal); color: #fff; }
+    .button.danger { border-color: #efc2be; background: #fff7f6; color: #b64b46; }
+    .button:focus-visible, .view-tab:focus-visible { outline: 3px solid rgba(13,122,120,.22); outline-offset: 2px; }
+
+    .runtime-panel { display: flex; flex-direction: column; min-height: 650px; overflow: hidden; }
+    .runtime-header { display: flex; align-items: center; gap: 14px; padding: 16px 17px 13px; border-bottom: 1px solid var(--line); }
+    .runtime-title { min-width: 0; flex: 1; }
+    .runtime-title h3 { margin: 0 0 3px; font-size: 15px; }
+    .runtime-title p { margin: 0; color: var(--muted); font-size: 12px; }
+    .view-switch { display: inline-flex; flex: none; padding: 3px; border: 1px solid var(--line); border-radius: 7px; background: #f4f7f8; }
+    .view-tab { border: 0; border-radius: 5px; padding: 7px 10px; color: var(--muted); background: transparent; cursor: pointer; font-size: 12px; font-weight: 750; }
+    .view-tab[aria-pressed="true"] { color: var(--teal); background: var(--surface); box-shadow: 0 1px 3px rgba(30,53,71,.11); }
+    .view { display: none; min-height: 0; flex: 1; }
+    .view.active { display: flex; }
+
+    .diagnostic-view { flex-direction: column; padding: 14px 15px 15px; gap: 10px; background: var(--panel-dark); }
+    .diagnostic-toolbar { display: flex; align-items: center; gap: 10px; color: #a8c0c2; font-size: 11px; }
+    .diagnostic-toolbar strong { color: #deeeee; font-size: 12px; }
+    .diagnostic-toolbar .spacer { flex: 1; }
+    .log-state { display: inline-flex; align-items: center; gap: 6px; color: var(--diag); }
+    .log-state::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--diag); }
+    .clear-log { border: 1px solid #42646a; border-radius: 5px; padding: 6px 9px; color: #c1d4d5; background: transparent; cursor: pointer; font-size: 11px; }
+    .log-box { flex: 1; min-height: 0; overflow: auto; padding: 14px; border: 1px solid #23444a; border-radius: 6px; background: #102126; color: var(--diag); font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; line-height: 1.85; }
+    .log-line { display: grid; grid-template-columns: 70px minmax(0, 1fr); gap: 10px; }
+    .log-time { color: #64878b; }
+    .log-line.warn { color: var(--hot); }
+    .log-line.error { color: #f4958d; }
+    .log-empty { color: #64878b; }
+    .diagnostic-footer { display: flex; gap: 12px; color: #90abad; font-size: 11px; }
+    .diagnostic-footer span strong { color: #d4e3e3; font-weight: 750; }
+
+    .model-view { flex-direction: column; background: #152a31; }
+    .model-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 13px 15px 10px; border-bottom: 1px solid #29464b; color: #bdd0cf; }
+    .model-toolbar strong { margin-right: auto; color: #eef8f5; font-size: 12px; }
+    .model-toolbar button { border: 1px solid #416267; border-radius: 5px; padding: 6px 8px; color: #b9cecd; background: #1c3a40; cursor: pointer; font-size: 11px; }
+    .model-toolbar button:hover { border-color: #77c8bd; color: #f5fffb; }
+    .model-stage { position: relative; flex: 1; min-height: 0; padding: 10px 16px 6px; }
+    .model-stage svg { display: block; width: 100%; height: 100%; min-height: 420px; }
+    .model-caption { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0 16px 14px; color: #86a6a6; font-size: 11px; }
+    .legend { display: flex; flex-wrap: wrap; gap: 12px; }
+    .legend-item { display: inline-flex; align-items: center; gap: 5px; }
+    .legend-swatch { width: 8px; height: 8px; border-radius: 50%; }
+    .legend-swatch.ok { background: var(--diag); }
+    .legend-swatch.hot { background: var(--hot); }
+    .legend-swatch.off { background: var(--danger); }
+    .counts { color: #b8ccca; white-space: nowrap; }
+
+    .robot-outline { fill: #223e44; stroke: #9dc1bd; stroke-width: 2; vector-effect: non-scaling-stroke; }
+    .robot-light { fill: #38575b; stroke: #93b6b2; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+    .robot-dark { fill: #1b3339; stroke: #7fa6a3; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+    .robot-accent { fill: #2b8f89; stroke: #b5e1d8; stroke-width: 1; vector-effect: non-scaling-stroke; }
+    .robot-line { stroke: #91b7b3; stroke-width: 3; stroke-linecap: round; fill: none; vector-effect: non-scaling-stroke; }
+    .robot-joint { fill: #11272d; stroke: #9dc1bd; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+    .motor-part { cursor: pointer; stroke: #11272d; stroke-width: 2; vector-effect: non-scaling-stroke; transition: fill .18s ease, filter .18s ease; }
+    .motor-part:hover { filter: brightness(1.16); }
+    .motor-part:focus-visible { filter: drop-shadow(0 0 3px rgba(239,255,250,.9)); }
+    .motor-part[data-status="ok"] { fill: var(--diag); }
+    .motor-part[data-status="hot"] { fill: var(--hot); }
+    .motor-part[data-status="off"] { fill: var(--danger); }
+    .motor-label { fill: #b3ccca; font-size: 8px; letter-spacing: .02em; }
+    .motor-id-label { fill: #17353a; font-size: 8px; font-weight: 850; letter-spacing: .02em; pointer-events: none; }
+    .head-id-label { fill: #b5e1d8; font-size: 8px; font-weight: 850; letter-spacing: .02em; pointer-events: none; }
+    .wheel-hub { fill: #17353a; stroke: #b5e1d8; stroke-width: 1.2; vector-effect: non-scaling-stroke; pointer-events: none; }
+    .wheel-id-label { fill: #b5e1d8; font-size: 7px; font-weight: 850; letter-spacing: .02em; pointer-events: none; }
+    .steer-id-label { fill: #17353a; font-size: 6px; font-weight: 850; letter-spacing: .02em; pointer-events: none; }
+    .callout-line { stroke: #527578; stroke-width: 1; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; }
+    .callout-label { fill: #88aaa8; font-size: 9px; }
+
+    @media (max-width: 1000px) {
+      .control-grid { grid-template-columns: 1fr; }
+      .runtime-panel { min-height: 620px; }
+    }
+
+    @media (max-width: 680px) {
+      .topbar { padding: 0 14px; }
+      .ready, .platform { display: none; }
+      .workspace { display: block; }
+      .sidebar { display: none; }
+      main { padding: 19px 14px 22px; }
+      .page-heading h2 { font-size: 21px; }
+      .runtime-header { align-items: flex-start; flex-direction: column; gap: 10px; }
+      .view-switch { width: 100%; }
+      .view-tab { flex: 1; }
+      .runtime-panel { min-height: 600px; }
+      .model-stage { padding: 6px 5px 0; }
+      .model-stage svg { min-height: 370px; }
+      .model-caption { align-items: flex-start; flex-direction: column; }
+      .log-line { grid-template-columns: 58px minmax(0, 1fr); gap: 7px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .motor-part { transition: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-mark" aria-hidden="true">OF</div>
+      <h1>OpenFlex 控制中心</h1>
+      <div class="topbar-spacer"></div>
+      <span class="ready">● 控制台就绪</span>
+      <span class="platform">ROS 2</span>
+      <div class="avatar" aria-label="OpenFlex">OF</div>
+    </header>
+
+    <div class="workspace">
+      <aside class="sidebar" aria-label="主导航">
+        <p class="sidebar-label">工作空间</p>
+        <button class="nav-item active">整机控制</button>
+        <button class="nav-item">电机管理</button>
+        <button class="nav-item">传感器</button>
+        <button class="nav-item">部署中心</button>
+        <p class="sidebar-footer">OpenFlex VR 全身控制上位机<br />ROS 后台进程统一管理</p>
+      </aside>
+
+      <main>
+        <div class="page-heading">
+          <h2>整机控制</h2>
+          <p>按启动顺序完成 CAN、执行器检查，再启动整机控制。</p>
+        </div>
+
+        <div class="control-grid">
+          <section class="workflow" aria-label="整机控制流程">
+            <div class="panel-heading">
+              <h3>整机控制</h3>
+              <p>按顺序准备底层接口、执行器和控制器</p>
+            </div>
+            <div class="step">
+              <div class="step-no">1</div>
+              <div class="step-copy"><div class="step-title"><span class="status-dot"></span>CAN 总线</div><p>先启用并确认 can0–can5 接口</p><div class="button-row"><button class="button primary">启用全部 CAN</button><button class="button danger">禁用全部</button></div></div>
+            </div>
+            <div class="step">
+              <div class="step-no">2</div>
+              <div class="step-copy"><div class="step-title"><span class="status-dot idle"></span>电机状态</div><p>检查全部控制器、节点和电机反馈</p><div class="button-row"><button class="button">检查全部状态</button></div></div>
+            </div>
+            <div class="step">
+              <div class="step-no">3</div>
+              <div class="step-copy"><div class="step-title"><span class="status-dot idle"></span>启动整机控制</div><p>加载全部控制器并进入可操作状态</p><div class="button-row"><button class="button primary">启动整机控制</button><button class="button danger">停止整机</button></div></div>
+            </div>
+            <div class="step">
+              <div class="step-no">4</div>
+              <div class="step-copy"><div class="step-title"><span class="status-dot idle"></span>VR 遥操作</div><p>启动 VR 控制，并选择是否接收底盘速度</p><div class="button-row"><button class="button primary">启动 VR</button><button class="button">停止</button></div></div>
+            </div>
+          </section>
+
+          <section class="runtime-panel" aria-label="运行诊断与整机模型">
+            <div class="runtime-header">
+              <div class="runtime-title"><h3 id="view-heading">运行诊断</h3><p id="view-subtitle">查看整机控制、VR 和传感器的实时输出</p></div>
+              <div class="view-switch" role="group" aria-label="右侧视图切换">
+                <button class="view-tab" data-view="diagnostic" aria-pressed="true">运行诊断</button>
+                <button class="view-tab" data-view="model" aria-pressed="false">整机模型</button>
+              </div>
+            </div>
+
+            <div class="view diagnostic-view active" data-panel="diagnostic">
+              <div class="diagnostic-toolbar"><strong>实时输出</strong><span class="log-state">监听中</span><span class="spacer"></span><button class="clear-log" type="button">清空日志</button></div>
+              <div class="log-box" id="log-box" role="log" aria-live="polite">
+                <div class="log-line"><span class="log-time">10:24:08</span><span>[OK] 全部 CAN 通道已启用</span></div>
+                <div class="log-line"><span class="log-time">10:24:10</span><span>[OK] 控制器检查完成，6 个控制器处于 active</span></div>
+                <div class="log-line"><span class="log-time">10:24:13</span><span>[INFO] 整机控制进程已启动 · PID 18423</span></div>
+                <div class="log-line"><span class="log-time">10:24:18</span><span>[INFO] 电池监控节点已连接</span></div>
+                <div class="log-line warn"><span class="log-time">10:24:22</span><span>[WARN] 等待 VR 头显连接</span></div>
+                <div class="log-line"><span class="log-time">10:24:28</span><span>[INFO] 诊断面板就绪，可切换至整机模型</span></div>
+              </div>
+              <div class="diagnostic-footer"><span>进程 <strong>4</strong></span><span>消息 <strong id="message-count">6</strong></span><span>最后更新 <strong>刚刚</strong></span></div>
+            </div>
+
+            <div class="view model-view" data-panel="model" aria-hidden="true">
+              <div class="model-toolbar"><strong>OpenFlex · 正视模型</strong><button type="button" data-cycle="all">全部节点</button><button type="button" data-cycle="head">头部</button><button type="button" data-cycle="left-arm">左臂</button><button type="button" data-cycle="right-arm">右臂</button><button type="button" data-cycle="lift">升降柱</button><button type="button" data-cycle="base">底盘</button></div>
+              <div class="model-stage">
+                <svg viewBox="0 0 560 620" role="img" aria-labelledby="robot-title robot-desc">
+                  <title id="robot-title">OpenFlex 整机正视二维模型</title>
+                  <desc id="robot-desc">包含头部、升降柱、左右双臂、底盘和电机状态节点的简化正视图</desc>
+                  <defs>
+                    <pattern id="grid" width="28" height="28" patternUnits="userSpaceOnUse"><path d="M 28 0 L 0 0 0 28" fill="none" stroke="#254249" stroke-width="1" /></pattern>
+                  </defs>
+                  <rect x="0" y="0" width="560" height="620" rx="6" fill="url(#grid)" />
+                  <line x1="280" y1="25" x2="280" y2="590" stroke="#3b5c60" stroke-dasharray="4 5" />
+                  <text x="280" y="42" text-anchor="middle" class="callout-label">FRONT ELEVATION</text>
+
+                  <!-- head: one complete housing plus the small rectangular motor below -->
+                  <rect x="246" y="68" width="68" height="49" rx="17" class="motor-part" data-motor-id="head-main" data-region="head" data-status="ok" tabindex="0" aria-label="头部一号电机，正常" />
+                  <rect x="257" y="80" width="46" height="18" rx="8" class="robot-dark" />
+                  <path d="M246 107 Q280 130 314 107" class="robot-line" />
+                  <text x="280" y="92" text-anchor="middle" class="head-id-label">H1</text>
+                  <rect x="261" y="118" width="38" height="26" rx="8" class="motor-part" data-motor-id="head-neck" data-region="head" data-status="ok" tabindex="0" aria-label="头部二号电机，正常" />
+                  <text x="280" y="135" text-anchor="middle" class="motor-id-label">H2</text>
+                  <text x="328" y="92" class="motor-label">HEAD 1 + 2</text>
+
+                  <!-- lift: one motor for the complete central column -->
+                  <rect x="247" y="144" width="66" height="150" rx="12" class="motor-part" data-motor-id="lift-column" data-region="lift" data-status="hot" tabindex="0" aria-label="升降柱电机，高温" />
+                  <rect x="261" y="154" width="38" height="130" rx="6" class="robot-dark" />
+                  <path d="M280 166 V273" class="robot-line" />
+                  <text x="326" y="211" class="motor-label">LIFT 1</text>
+
+                  <!-- arms: eight independently addressable motors per side -->
+                  <path d="M206 184 L184 257 L205 331 L184 407" class="robot-line" />
+                  <path d="M354 184 L376 257 L355 331 L376 407" class="robot-line" />
+                  <rect x="188" y="143" width="61" height="46" rx="18" class="motor-part" data-motor-id="left-shoulder" data-region="left-arm" data-status="ok" tabindex="0" aria-label="左肩一号关节电机，正常" />
+                  <rect x="311" y="143" width="61" height="46" rx="18" class="motor-part" data-motor-id="right-shoulder" data-region="right-arm" data-status="ok" tabindex="0" aria-label="右肩一号关节电机，正常" />
+                  <text x="218" y="170" text-anchor="middle" class="motor-id-label">L1</text><text x="342" y="170" text-anchor="middle" class="motor-id-label">R1</text>
+                  <rect x="174" y="193" width="24" height="34" rx="9" class="motor-part" data-motor-id="left-upper-1" data-region="left-arm" data-status="ok" tabindex="0" aria-label="左臂二号关节电机，正常" transform="rotate(17 186 210)" />
+                  <rect x="362" y="193" width="24" height="34" rx="9" class="motor-part" data-motor-id="right-upper-1" data-region="right-arm" data-status="off" tabindex="0" aria-label="右臂二号关节电机，未检测" transform="rotate(-17 374 210)" />
+                  <text x="186" y="213" text-anchor="middle" class="motor-id-label">L2</text><text x="374" y="213" text-anchor="middle" class="motor-id-label">R2</text>
+                  <rect x="169" y="228" width="28" height="32" rx="10" class="motor-part" data-motor-id="left-upper-2" data-region="left-arm" data-status="ok" tabindex="0" aria-label="左臂三号关节电机，正常" transform="rotate(17 183 244)" />
+                  <rect x="363" y="228" width="28" height="32" rx="10" class="motor-part" data-motor-id="right-upper-2" data-region="right-arm" data-status="ok" tabindex="0" aria-label="右臂三号关节电机，正常" transform="rotate(-17 377 244)" />
+                  <text x="183" y="247" text-anchor="middle" class="motor-id-label">L3</text><text x="377" y="247" text-anchor="middle" class="motor-id-label">R3</text>
+                  <rect x="169" y="263" width="30" height="31" rx="11" class="motor-part" data-motor-id="left-elbow" data-region="left-arm" data-status="hot" tabindex="0" aria-label="左肘四号关节电机，高温" transform="rotate(17 184 278)" />
+                  <rect x="361" y="263" width="30" height="31" rx="11" class="motor-part" data-motor-id="right-elbow" data-region="right-arm" data-status="ok" tabindex="0" aria-label="右肘四号关节电机，正常" transform="rotate(-17 376 278)" />
+                  <text x="184" y="282" text-anchor="middle" class="motor-id-label">L4</text><text x="376" y="282" text-anchor="middle" class="motor-id-label">R4</text>
+                  <rect x="177" y="298" width="27" height="32" rx="10" class="motor-part" data-motor-id="left-forearm-1" data-region="left-arm" data-status="ok" tabindex="0" aria-label="左臂五号关节电机，正常" transform="rotate(-16 190 314)" />
+                  <rect x="356" y="298" width="27" height="32" rx="10" class="motor-part" data-motor-id="right-forearm-1" data-region="right-arm" data-status="hot" tabindex="0" aria-label="右臂五号关节电机，高温" transform="rotate(16 369 314)" />
+                  <text x="190" y="318" text-anchor="middle" class="motor-id-label">L5</text><text x="369" y="318" text-anchor="middle" class="motor-id-label">R5</text>
+                  <rect x="181" y="333" width="27" height="32" rx="10" class="motor-part" data-motor-id="left-forearm-2" data-region="left-arm" data-status="ok" tabindex="0" aria-label="左臂六号关节电机，正常" transform="rotate(-16 194 349)" />
+                  <rect x="352" y="333" width="27" height="32" rx="10" class="motor-part" data-motor-id="right-forearm-2" data-region="right-arm" data-status="ok" tabindex="0" aria-label="右臂六号关节电机，正常" transform="rotate(16 365 349)" />
+                  <text x="194" y="353" text-anchor="middle" class="motor-id-label">L6</text><text x="365" y="353" text-anchor="middle" class="motor-id-label">R6</text>
+                  <rect x="184" y="368" width="26" height="29" rx="10" class="motor-part" data-motor-id="left-wrist" data-region="left-arm" data-status="ok" tabindex="0" aria-label="左腕七号关节电机，正常" transform="rotate(-16 197 382)" />
+                  <rect x="350" y="368" width="26" height="29" rx="10" class="motor-part" data-motor-id="right-wrist" data-region="right-arm" data-status="hot" tabindex="0" aria-label="右腕七号关节电机，高温" transform="rotate(16 363 382)" />
+                  <text x="197" y="386" text-anchor="middle" class="motor-id-label">L7</text><text x="363" y="386" text-anchor="middle" class="motor-id-label">R7</text>
+                  <path d="M173 407 Q184 424 196 407 L194 431 Q184 443 174 431Z" class="motor-part" data-motor-id="left-hand" data-region="left-arm" data-status="hot" tabindex="0" aria-label="左手八号关节电机，高温" />
+                  <path d="M364 407 Q376 424 387 407 L386 431 Q376 443 365 431Z" class="motor-part" data-motor-id="right-hand" data-region="right-arm" data-status="ok" tabindex="0" aria-label="右手八号关节电机，正常" />
+                  <text x="184" y="421" text-anchor="middle" class="motor-id-label">L8</text><text x="376" y="421" text-anchor="middle" class="motor-id-label">R8</text>
+
+                  <!-- chassis: eight base motors, with the body centered between wheel rows -->
+                  <rect x="202" y="474" width="156" height="82" rx="18" class="robot-outline" />
+                  <rect x="224" y="491" width="112" height="47" rx="9" class="robot-dark" />
+                  <rect x="265" y="505" width="30" height="9" rx="4" class="robot-accent" />
+                  <rect x="174" y="442" width="32" height="69" rx="13" class="motor-part" data-motor-id="base-front-left" data-region="base" data-status="ok" tabindex="0" aria-label="底盘左前驱动轮 W1 电机，正常" />
+                  <rect x="354" y="442" width="32" height="69" rx="13" class="motor-part" data-motor-id="base-front-right" data-region="base" data-status="ok" tabindex="0" aria-label="底盘右前驱动轮 W2 电机，正常" />
+                  <rect x="174" y="534" width="32" height="58" rx="13" class="motor-part" data-motor-id="base-rear-left" data-region="base" data-status="hot" tabindex="0" aria-label="底盘左后驱动轮 W3 电机，高温" />
+                  <rect x="354" y="534" width="32" height="58" rx="13" class="motor-part" data-motor-id="base-rear-right" data-region="base" data-status="off" tabindex="0" aria-label="底盘右后驱动轮 W4 电机，未检测" />
+                  <circle cx="190" cy="476" r="7" class="wheel-hub" /><text x="190" y="479" text-anchor="middle" class="wheel-id-label">W1</text>
+                  <circle cx="370" cy="476" r="7" class="wheel-hub" /><text x="370" y="479" text-anchor="middle" class="wheel-id-label">W2</text>
+                  <circle cx="190" cy="563" r="7" class="wheel-hub" /><text x="190" y="566" text-anchor="middle" class="wheel-id-label">W3</text>
+                  <circle cx="370" cy="563" r="7" class="wheel-hub" /><text x="370" y="566" text-anchor="middle" class="wheel-id-label">W4</text>
+                  <path d="M210 457 H224 L228 461 V491 L224 495 H210 L206 491 V461Z" class="motor-part" data-motor-id="steer-front-left" data-region="base" data-status="ok" tabindex="0" aria-label="底盘左前转向电机 S1，正常" />
+                  <path d="M336 457 H350 L354 461 V491 L350 495 H336 L332 491 V461Z" class="motor-part" data-motor-id="steer-front-right" data-region="base" data-status="ok" tabindex="0" aria-label="底盘右前转向电机 S2，正常" />
+                  <path d="M210 546 H224 L228 550 V578 L224 582 H210 L206 578 V550Z" class="motor-part" data-motor-id="steer-rear-left" data-region="base" data-status="hot" tabindex="0" aria-label="底盘左后转向电机 S3，高温" />
+                  <path d="M336 546 H350 L354 550 V578 L350 582 H336 L332 578 V550Z" class="motor-part" data-motor-id="steer-rear-right" data-region="base" data-status="off" tabindex="0" aria-label="底盘右后转向电机 S4，未检测" />
+                  <text x="217" y="476" text-anchor="middle" class="steer-id-label">S1</text><text x="343" y="476" text-anchor="middle" class="steer-id-label">S2</text>
+                  <text x="217" y="565" text-anchor="middle" class="steer-id-label">S3</text><text x="343" y="565" text-anchor="middle" class="steer-id-label">S4</text>
+                  <text x="280" y="570" text-anchor="middle" class="callout-label">WHEELS 4 · DRIVE + STEER 4</text>
+
+                  <line x1="207" y1="166" x2="121" y2="140" class="callout-line" /><text x="42" y="137" class="callout-label">LEFT ARM · 8</text>
+                  <line x1="353" y1="166" x2="439" y2="140" class="callout-line" /><text x="440" y="137" class="callout-label">RIGHT ARM · 8</text>
+                  <line x1="247" y1="200" x2="137" y2="226" class="callout-line" /><text x="49" y="230" class="callout-label">LIFT COLUMN · 1</text>
+                </svg>
+              </div>
+              <div class="model-caption"><div class="legend"><span class="legend-item"><span class="legend-swatch ok"></span>正常 <strong id="ok-count">17</strong></span><span class="legend-item"><span class="legend-swatch hot"></span>高温 <strong id="hot-count">7</strong></span><span class="legend-item"><span class="legend-swatch off"></span>未检测/失能 <strong id="off-count">3</strong></span></div><span class="counts" id="model-status-text">27 个节点 · 头部2 / 升降1 / 双臂16 / 底盘8</span></div>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    (() => {
+      const state = { view: "diagnostic", statuses: ["ok", "hot", "off"] };
+      const labels = { diagnostic: ["运行诊断", "查看整机控制、VR 和传感器的实时输出"], model: ["整机模型", "正面视图 · 电机状态模拟"] };
+      const tabs = [...document.querySelectorAll(".view-tab")];
+      const panels = [...document.querySelectorAll("[data-panel]")];
+      const heading = document.querySelector("#view-heading");
+      const subtitle = document.querySelector("#view-subtitle");
+      const logBox = document.querySelector("#log-box");
+      const countNodes = { ok: document.querySelector("#ok-count"), hot: document.querySelector("#hot-count"), off: document.querySelector("#off-count") };
+      const modelStatusText = document.querySelector("#model-status-text");
+      const topologySummary = "头部2 / 升降1 / 双臂16 / 轮组4 + 转向4";
+      const statusText = { ok: "正常", hot: "高温", off: "未检测/失能" };
+      const nodes = [...document.querySelectorAll(".motor-part[data-motor-id]")];
+
+      function setView(view) {
+        state.view = view;
+        tabs.forEach(tab => tab.setAttribute("aria-pressed", String(tab.dataset.view === view)));
+        panels.forEach(panel => {
+          const active = panel.dataset.panel === view;
+          panel.classList.toggle("active", active);
+          panel.setAttribute("aria-hidden", String(!active));
+        });
+        heading.textContent = labels[view][0];
+        subtitle.textContent = labels[view][1];
+      }
+
+      function updateCounts() {
+        const counts = { ok: 0, hot: 0, off: 0 };
+        nodes.forEach(node => counts[node.dataset.status]++);
+        Object.keys(counts).forEach(key => countNodes[key].textContent = counts[key]);
+        modelStatusText.textContent = `${nodes.length} 个节点 · ${topologySummary}`;
+      }
+
+      function applyStatus(node, status) {
+        node.dataset.status = status;
+        node.setAttribute("aria-label", `${node.getAttribute("aria-label").replace(/，(正常|高温|未检测|未检测\/失能)$/, "")}，${statusText[status]}`);
+      }
+
+      function cycle(region) {
+        const scoped = region === "all" ? nodes : nodes.filter(node => node.dataset.region === region);
+        if (!scoped.length) return;
+        const next = state.statuses[(state.statuses.indexOf(scoped[0].dataset.status) + 1) % state.statuses.length];
+        scoped.forEach(node => applyStatus(node, next));
+        updateCounts();
+      }
+
+      tabs.forEach(tab => tab.addEventListener("click", () => setView(tab.dataset.view)));
+      document.querySelectorAll("[data-cycle]").forEach(button => button.addEventListener("click", () => cycle(button.dataset.cycle)));
+      nodes.forEach(node => node.addEventListener("click", () => cycle(node.dataset.region)));
+      nodes.forEach(node => node.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); cycle(node.dataset.region); } }));
+      document.querySelector(".clear-log").addEventListener("click", () => {
+        logBox.innerHTML = '<div class="log-empty">日志已清空，等待新的运行输出…</div>';
+        document.querySelector("#message-count").textContent = "0";
+      });
+      setView("diagnostic");
+      updateCounts();
+    })();
+  </script>
+</body>
+</html>

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from collections.abc import Sequence
 import os
 from pathlib import Path
 import shutil
@@ -6,6 +7,8 @@ import signal
 import tempfile
 
 from PySide6.QtCore import QProcess, QProcessEnvironment, QObject, QTimer, Signal
+
+FORCE_CANCEL_TIMEOUT_MS = 8000
 
 
 @dataclass(frozen=True)
@@ -21,9 +24,6 @@ class DeploymentTask:
 DEPLOYMENT_TASKS = {
     task.task_id: task
     for task in (
-        DeploymentTask(
-            "openflex", "完整安装", "--openflex", "安装依赖、驱动并编译工作空间", True, True
-        ),
         DeploymentTask(
             "environment", "环境安装", "--environment", "修改系统软件包和 Python 环境", True
         ),
@@ -43,7 +43,7 @@ DEPLOYMENT_TASKS = {
             "lidar", "雷达配置", "--lidar", "交互式修改 MID360 网络配置", True
         ),
         DeploymentTask(
-            "sync-source", "源码同步", "--sync-source", "下载或更新发售版源码", True
+            "sync-source", "下载与更新", "--sync-source", "逐组件检查版本并下载或更新源码", True
         ),
     )
 }
@@ -66,17 +66,19 @@ class DeploymentCommandBuilder:
             raise ValueError(f"unsupported deployment task: {task_id}") from exc
 
     @staticmethod
-    def _validate_jobs(jobs: int) -> None:
+    def _validate_jobs(jobs: int | None) -> None:
+        if jobs is None:
+            return
         if isinstance(jobs, bool) or not isinstance(jobs, int) or not 1 <= jobs <= 32:
             raise ValueError("parallel workers must be an integer from 1 to 32")
 
-    def build(self, task_id: str, *, dry_run: bool = False, jobs: int = 1) -> list[str]:
+    def build(self, task_id: str, *, dry_run: bool = False, jobs: int | None = None) -> list[str]:
         task = self.task(task_id)
         self._validate_jobs(jobs)
         command = [str(self.script_path), task.script_flag]
         if dry_run:
             command.append("--dry-run")
-        if task.supports_jobs:
+        if task.supports_jobs and jobs is not None:
             command.extend(("--jobs", str(jobs)))
         return command
 
@@ -100,6 +102,7 @@ class DeploymentRunner(QObject):
         self._log_offset = 0
         self._cancel_requested = False
         self._cancel_process_group = None
+        self._output_tail = ""
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(150)
         self._poll_timer.timeout.connect(self._poll_terminal_log)
@@ -112,11 +115,21 @@ class DeploymentRunner(QObject):
     def active_task(self) -> str | None:
         return self._active_task
 
-    def start(self, task_id: str, *, dry_run: bool = False, jobs: int = 1) -> None:
+    def start(
+        self,
+        task_id: str,
+        *,
+        dry_run: bool = False,
+        jobs: int | None = None,
+        input_lines: Sequence[str] | None = None,
+    ) -> None:
         if self.is_running:
             raise RuntimeError("a deployment task is already running")
 
         command = self.builder.build(task_id, dry_run=dry_run, jobs=jobs)
+        pending_input = list(input_lines or [])
+        if pending_input and not self.builder.requires_terminal(task_id, dry_run=dry_run):
+            raise ValueError(f"deployment task does not accept interactive input: {task_id}")
         self._active_task = task_id
         self._log_offset = 0
         self._temporary_dir = None
@@ -124,7 +137,9 @@ class DeploymentRunner(QObject):
         self._cancel_process_group = None
         self._process = self._process_factory()
         self._process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        self._process.readyReadStandardOutput.connect(self._read_direct_output)
+        terminal_required = self.builder.requires_terminal(task_id, dry_run=dry_run)
+        if not terminal_required:
+            self._process.readyReadStandardOutput.connect(self._read_direct_output)
         self._process.finished.connect(self._on_process_finished)
         if hasattr(self._process, "errorOccurred"):
             self._process.errorOccurred.connect(self._on_process_error)
@@ -134,8 +149,10 @@ class DeploymentRunner(QObject):
         self._process.setProcessEnvironment(environment)
         self._process.setWorkingDirectory(str(self.builder.workspace_dir))
 
-        if self.builder.requires_terminal(task_id, dry_run=dry_run):
+        if terminal_required:
             self._start_terminal(command, environment)
+            for line in pending_input:
+                self.send_input(line)
         else:
             self._start_direct(command)
         self.state_changed.emit("running")
@@ -149,19 +166,25 @@ class DeploymentRunner(QObject):
         self._temporary_dir = Path(tempfile.mkdtemp(prefix="openflex-deploy-"))
         bridge = Path(__file__).with_name("deployment_terminal_bridge.py")
         arguments = [
-            "--wait",
-            "--",
-            "/usr/bin/python3",
             str(bridge),
             "--state-dir",
             str(self._temporary_dir),
             "--installer-args",
             *command,
         ]
-        self._process.setProgram("/usr/bin/gnome-terminal")
+        self._process.setProgram("/usr/bin/python3")
         self._process.setArguments(arguments)
         self._process.start()
         self._poll_timer.start()
+
+    def send_input(self, text: str) -> None:
+        """Send one line to an interactive installer running inside the GUI."""
+        process = self._process
+        if process is None or not hasattr(process, "write"):
+            return
+        if not text.endswith("\n"):
+            text += "\n"
+        process.write(text.encode())
 
     def _read_direct_output(self) -> None:
         data = self._process.readAllStandardOutput()
@@ -169,6 +192,7 @@ class DeploymentRunner(QObject):
             data = data.data()
         text = bytes(data).decode(errors="replace")
         if text:
+            self._output_tail = (self._output_tail + text)[-4000:]
             self.output.emit(text)
 
     def _poll_terminal_log(self) -> None:
@@ -182,7 +206,13 @@ class DeploymentRunner(QObject):
             data = log_file.read()
             self._log_offset = log_file.tell()
         if data:
-            self.output.emit(data.decode(errors="replace"))
+            text = data.decode(errors="replace")
+            self._output_tail = (self._output_tail + text)[-4000:]
+            self.output.emit(text)
+
+    @property
+    def output_tail(self) -> str:
+        return self._output_tail
 
     def _on_process_error(self, error) -> None:
         if self._process is None:
@@ -247,7 +277,20 @@ class DeploymentRunner(QObject):
                 process.terminate()
         except (ProcessLookupError, PermissionError, OSError):
             process.terminate()
-        QTimer.singleShot(3000, lambda: self._force_cancel(process))
+        QTimer.singleShot(FORCE_CANCEL_TIMEOUT_MS, lambda: self._force_cancel(process))
+
+    def wait_for_finished(self, timeout_ms: int = FORCE_CANCEL_TIMEOUT_MS) -> bool:
+        """Synchronously drain a cancelled process during host shutdown."""
+        process = self._process
+        if process is None:
+            return True
+        if hasattr(process, "waitForFinished"):
+            finished = bool(process.waitForFinished(timeout_ms))
+            if not finished:
+                self._force_cancel(process)
+            return finished
+        self._force_cancel(process)
+        return False
 
     def _force_cancel(self, process) -> None:
         if process is None or self._process is not process:
@@ -256,7 +299,8 @@ class DeploymentRunner(QObject):
         if state != QProcess.ProcessState.NotRunning:
             if self._cancel_process_group:
                 try:
-                    os.killpg(self._cancel_process_group, signal.SIGTERM)
+                    os.killpg(self._cancel_process_group, signal.SIGKILL)
+                    return
                 except (ProcessLookupError, PermissionError, OSError):
                     pass
             process.kill()

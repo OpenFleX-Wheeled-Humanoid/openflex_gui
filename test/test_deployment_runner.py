@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -34,6 +35,7 @@ class FakeProcess:
         self.started = False
         self.terminated = False
         self.killed = False
+        self.writes = []
 
     def setProcessChannelMode(self, mode):
         self.channel_mode = mode
@@ -70,6 +72,10 @@ class FakeProcess:
 
     def readAllStandardOutput(self):
         return b""
+
+    def write(self, data):
+        self.writes.append(bytes(data))
+        return len(data)
 
 
 class DeploymentRunnerTest(unittest.TestCase):
@@ -123,23 +129,51 @@ class DeploymentRunnerTest(unittest.TestCase):
         process.finished.emit(0, QProcess.NormalExit)
         self.assertFalse(runner.is_running)
 
-    def test_actual_driver_install_uses_terminal_bridge(self):
+    def test_interactive_driver_install_uses_embedded_pty_bridge(self):
         runner = self._runner()
 
         runner.start("kcan")
 
         process = self.processes[-1]
-        self.assertEqual(process.program, "/usr/bin/gnome-terminal")
-        self.assertEqual(process.arguments[:3], ["--wait", "--", "/usr/bin/python3"])
-        self.assertIn("deployment_terminal_bridge.py", process.arguments[3])
+        self.assertEqual(process.program, "/usr/bin/python3")
+        self.assertIn("deployment_terminal_bridge.py", process.arguments[0])
         separator = process.arguments.index("--installer-args")
         self.assertEqual(
             process.arguments[separator + 1 :],
             [str(self.script), "--kcan"],
         )
+        runner.send_input("secret")
+        self.assertEqual(process.writes, [b"secret\n"])
         self.assertTrue(runner.is_running)
 
         process.finished.emit(0, QProcess.NormalExit)
+        self.assertFalse(runner.is_running)
+
+    def test_interactive_task_does_not_read_bridge_stdout_as_a_second_log(self):
+        runner = self._runner()
+
+        runner.start("kcan")
+
+        self.assertEqual(self.processes[-1].readyReadStandardOutput.callbacks, [])
+
+        self.processes[-1].finished.emit(0, QProcess.NormalExit)
+
+    def test_start_writes_ordered_interactive_input_lines_once(self):
+        runner = self._runner()
+
+        runner.start("vr", input_lines=["2", "yes"])
+
+        process = self.processes[-1]
+        self.assertEqual(process.writes, [b"2\n", b"yes\n"])
+
+        process.finished.emit(0, QProcess.NormalExit)
+
+    def test_direct_task_rejects_interactive_input(self):
+        runner = self._runner()
+
+        with self.assertRaises(ValueError):
+            runner.start("compile", input_lines=["unexpected"])
+
         self.assertFalse(runner.is_running)
 
     def test_rejects_a_second_task_while_running(self):
@@ -174,9 +208,9 @@ class DeploymentRunnerTest(unittest.TestCase):
         with patch("openflex_gui.deployment_runner.os.killpg") as killpg:
             runner._force_cancel(process)
 
-        killpg.assert_called_once_with(777, 15)
-        self.assertTrue(process.killed)
-        process.finished.emit(143, QProcess.NormalExit)
+        killpg.assert_called_once_with(777, signal.SIGKILL)
+        self.assertFalse(process.killed)
+        process.finished.emit(137, QProcess.NormalExit)
 
     def test_failed_process_start_resets_runner(self):
         runner = self._runner()
@@ -232,9 +266,35 @@ class DeploymentRunnerTest(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 7)
-        self.assertIn("bridge-output", result.stdout)
+        self.assertNotIn("bridge-output", result.stdout)
         self.assertIn("bridge-output", (state_dir / "output.log").read_text())
         self.assertEqual((state_dir / "exit.status").read_text().strip(), "7")
+
+    def test_terminal_bridge_accepts_input_without_external_terminal(self):
+        state_dir = Path(self.temp_dir.name) / "interactive-state"
+        command = Path(self.temp_dir.name) / "interactive-task.sh"
+        command.write_text(
+            "#!/usr/bin/env bash\nread -r value\nprintf 'received=%s\\n' \"$value\"\n",
+            encoding="utf-8",
+        )
+        command.chmod(0o755)
+        bridge = Path(__file__).resolve().parents[1] / "openflex_gui" / "deployment_terminal_bridge.py"
+        process = subprocess.Popen(
+            [sys.executable, str(bridge), "--state-dir", str(state_dir), "--installer-args", str(command)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        process.stdin.write("embedded-input\n")
+        process.stdin.flush()
+        output, _ = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0)
+        self.assertNotIn("received=embedded-input", output)
+        self.assertIn(
+            "received=embedded-input",
+            (state_dir / "output.log").read_text(encoding="utf-8"),
+        )
 
 
 class DeploymentCommandBuilderTest(unittest.TestCase):
@@ -260,7 +320,6 @@ class DeploymentCommandBuilderTest(unittest.TestCase):
         self.assertEqual(
             list(module.DEPLOYMENT_TASKS),
             [
-                "openflex",
                 "environment",
                 "compile",
                 "kcan",
@@ -276,6 +335,10 @@ class DeploymentCommandBuilderTest(unittest.TestCase):
         module = self._module()
         builder = module.DeploymentCommandBuilder(self.script, self.workspace)
 
+        self.assertEqual(
+            builder.build("compile"),
+            [str(self.script), "--compile"],
+        )
         self.assertEqual(
             builder.build("compile", jobs=4),
             [str(self.script), "--compile", "--jobs", "4"],

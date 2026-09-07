@@ -28,6 +28,8 @@ def main() -> int:
         ["/usr/bin/script", "-qefc", command, str(output_path)],
         cwd=os.environ.get("OPENFLEX_WORKSPACE", None),
         start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     pid_path.write_text(f"{child.pid}\n", encoding="ascii")
     try:
