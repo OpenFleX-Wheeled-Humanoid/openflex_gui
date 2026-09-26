@@ -1,0 +1,2683 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+OpenFlex VR 全身控制上位机
+管理 CAN 总线、检查电机状态、启动整机控制和 VR 遥操作。
+"""
+
+import sys
+import os
+import shlex
+import shutil
+import signal
+import subprocess
+import socket
+import struct
+import time
+import threading
+import re
+
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QTextEdit, QLabel, QGroupBox, QSizePolicy, QFrame, QCheckBox,
+    QToolButton, QStyle, QStackedWidget, QScrollArea, QSplitter,
+    QGridLayout
+)
+from PySide6.QtCore import Qt, QProcess, QSettings, Signal, QObject, QTimer
+from PySide6.QtGui import QFont, QColor, QTextCursor, QIcon
+
+from .motor_manager_adapter import MotorManagerAdapter
+from .deployment_runner import DeploymentCommandBuilder, DeploymentRunner, DEPLOYMENT_TASKS
+from .deployment_config_dialog import DeploymentConfigDialog
+from .theme_manager import ThemeManager
+
+# ─── 项目路径 ──────────────────────────────────────────────────────
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_ICON_FILE = os.path.join(_SCRIPT_DIR, 'openflex_vr.png')
+
+
+def _find_workspace_dir(start_dir: str) -> str:
+    """Find the Openflex workspace from either source or installed package paths."""
+    current = os.path.abspath(start_dir)
+    while True:
+        if (
+            os.path.exists(os.path.join(current, 'install', 'setup.bash'))
+            and os.path.isdir(os.path.join(current, 'src'))
+        ):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return os.path.abspath(os.path.join(_SCRIPT_DIR, '..', '..', '..', '..'))
+        current = parent
+
+
+_WORKSPACE_DIR = _find_workspace_dir(_SCRIPT_DIR)
+_SRC_DIR = os.path.join(_WORKSPACE_DIR, 'src')
+_SETUP_BASH = os.path.join(_WORKSPACE_DIR, 'install', 'setup.bash')
+_CAN_HELPER = os.path.join(_SCRIPT_DIR, 'enable_can_helper.sh')
+_DISABLE_CAN_HELPER = os.path.join(_SCRIPT_DIR, 'disable_can_helper.sh')
+_BATTERY_SERIAL_HELPER = os.path.join(_SCRIPT_DIR, 'enable_battery_serial_helper.sh')
+_CAMERA_CONFIG = os.path.join(
+    _WORKSPACE_DIR, 'src', 'openflex_vla', 'config', 'cameras', 'cameras_config_30fps.yaml'
+)
+_DEPLOYMENT_SCRIPT = os.path.join(
+    _SRC_DIR, 'OpenFleX', 'install_openflex_drivers_and_build.sh'
+)
+FORCE_STOP_TIMEOUT_MS = 8000
+DEACTIVATE_TIMEOUT_SECONDS = 4
+COMBINED_VR_START_DELAY_MS = 4000
+
+# 将 can_utils / check_motor_status 所在目录加入 path
+def _find_motor_scripts_dir() -> str:
+    candidates = (
+        os.path.join(_SRC_DIR, 'openflex_integrated', 'openflex_manager', 'scripts'),
+        os.path.join(_SRC_DIR, 'openflex_armx', 'openarmx_motor_manager', 'scripts'),
+    )
+    for path in candidates:
+        if os.path.exists(os.path.join(path, 'can_utils.py')):
+            return path
+    return candidates[0]
+
+
+_MOTOR_SCRIPTS_DIR = _find_motor_scripts_dir()
+if _MOTOR_SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _MOTOR_SCRIPTS_DIR)
+
+
+def _find_realsense_viewer() -> str | None:
+    """Resolve the viewer from the active ROS installation or executable PATH."""
+    active_distro = os.environ.get('ROS_DISTRO')
+    if active_distro:
+        candidate = os.path.join('/opt/ros', active_distro, 'bin', 'realsense-viewer')
+        if os.path.isfile(candidate):
+            return candidate
+
+    viewer = shutil.which('realsense-viewer')
+    if viewer:
+        return viewer
+
+    ros_root = '/opt/ros'
+    if os.path.isdir(ros_root):
+        for distro in sorted(os.listdir(ros_root), reverse=True):
+            candidate = os.path.join(ros_root, distro, 'bin', 'realsense-viewer')
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+# ─── CAN 配置（与 en_all_can.py 一致）──────────────────────────────
+ROBOT_CAN_CONFIG = {
+    'can0': 1000000,   # 右臂 Robstride
+    'can1': 1000000,   # 左臂 Robstride
+    'can2': 1000000,   # 头部 Robstride
+    'can3': 1000000,   # 升降台 CANopen
+    'can4': 1000000,   # 底盘驱动 UM 轮毂电机
+    'can5': 1000000,   # 底盘转向 RS06
+}
+
+
+# ─── 信号桥（子线程 → GUI 线程）───────────────────────────────────
+class _Signals(QObject):
+    log = Signal(str)
+    log_html = Signal(str)
+    ui = Signal(object)
+
+
+# ─── 状态指示灯 Widget ────────────────────────────────────────────
+class StatusDot(QLabel):
+    """小圆点状态指示：灰=空闲  绿=运行  红=异常"""
+    _COLORS = {
+        'idle':    '#888888',
+        'running': '#2ecc71',
+        'error':   '#e74c3c',
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(16, 16)
+        self.status_label = None
+        self._state = 'idle'
+        self._state_texts = {
+            'idle': '待启动',
+            'running': '运行中',
+            'error': '异常',
+        }
+        self.set_state('idle')
+
+    def bind_status_label(self, label: QLabel, state_texts: dict):
+        self.status_label = label
+        self._state_texts = state_texts
+        label.setText(state_texts.get(self._state, self._state))
+
+    def set_state(self, state: str):
+        self._state = state
+        c = self._COLORS.get(state, self._COLORS['idle'])
+        self.setStyleSheet(
+            f"background-color: {c}; border-radius: 8px; border: 1px solid #555;"
+        )
+        if self.status_label is not None:
+            self.status_label.setText(self._state_texts.get(state, state))
+
+
+# ─── 主窗口 ──────────────────────────────────────────────────────
+class MainWindow(QMainWindow):
+    def __init__(self, settings: QSettings | None = None, motor_adapter_factory=None,
+                 deployment_runner_factory=None):
+        super().__init__()
+        self.setWindowTitle('OpenFlex VR 全身控制上位机')
+        self.setMinimumSize(1024, 700)
+        self.resize(1360, 820)
+        self.setWindowIcon(QIcon(_ICON_FILE))
+        self._signals = _Signals()
+        self._signals.log.connect(self._append_log)
+        self._signals.log_html.connect(self._append_log_html)
+        self._signals.ui.connect(self._run_ui_callback)
+        self.theme_manager = ThemeManager(settings)
+        self._motor_adapter_factory = motor_adapter_factory or MotorManagerAdapter
+        self._deployment_runner_factory = deployment_runner_factory or DeploymentRunner
+        self.motor_manager_adapter = None
+        self.motor_page = None
+        self.deployment_runner = None
+        self._deployment_locked_states = None
+
+        # 子进程管理
+        self._proc_bringup: QProcess | None = None
+        self._proc_battery: QProcess | None = None
+        self._battery_stop_requested = False
+        self._proc_vr: QProcess | None = None
+        self._proc_video: QProcess | None = None
+        self._proc_camera: QProcess | None = None
+        self._proc_camera_ros: QProcess | None = None
+        self._proc_lidar: QProcess | None = None
+        self._start_sequence_after_can = False
+        self._auto_start_vr_pending = False
+        self._combined_start_active = False
+        self._combined_bringup_owned = False
+        self._combined_vr_owned = False
+        self._combined_stop_pending = False
+        self._o6_mode = False
+
+        self._build_ui()
+        self._apply_theme()
+
+    # ── UI 构建 ──────────────────────────────────────────────────
+    def _build_ui(self):
+        central = QWidget()
+        central.setObjectName('appRoot')
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        topbar = QFrame()
+        topbar.setObjectName('topBar')
+        topbar.setFixedHeight(60)
+        topbar_layout = QHBoxLayout(topbar)
+        topbar_layout.setContentsMargins(20, 0, 22, 0)
+        topbar_layout.setSpacing(10)
+        brand_icon = QLabel()
+        brand_icon.setObjectName('brandIcon')
+        brand_icon.setFixedSize(34, 34)
+        brand_icon.setAlignment(Qt.AlignCenter)
+        brand_icon.setPixmap(QIcon(_ICON_FILE).pixmap(28, 28))
+        title = QLabel('OpenFlex 控制中心')
+        title.setObjectName('appTitle')
+        title.setFont(QFont('Sans', 12, QFont.Bold))
+        health = QLabel('● 控制台就绪')
+        health.setObjectName('healthStatus')
+        platform = QLabel('ROS 2')
+        platform.setObjectName('platformLabel')
+        self.btn_theme = QToolButton()
+        self.btn_theme.setObjectName('themeToggleButton')
+        self.btn_theme.setFixedSize(34, 34)
+        self.btn_theme.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self.btn_theme.clicked.connect(self._toggle_theme)
+        avatar = QLabel('OF')
+        avatar.setObjectName('avatar')
+        avatar.setAlignment(Qt.AlignCenter)
+        avatar.setFixedSize(28, 28)
+        topbar_layout.addWidget(brand_icon)
+        topbar_layout.addWidget(title)
+        topbar_layout.addStretch(1)
+        topbar_layout.addWidget(health)
+        topbar_layout.addSpacing(10)
+        topbar_layout.addWidget(platform)
+        topbar_layout.addWidget(self.btn_theme)
+        topbar_layout.addWidget(avatar)
+        root.addWidget(topbar)
+
+        body = QWidget()
+        body_layout = QHBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(0)
+        root.addWidget(body, 1)
+
+        sidebar = QFrame()
+        sidebar.setObjectName('sideBar')
+        sidebar.setFixedWidth(218)
+        self.sidebar = sidebar
+        self.sidebar_expanded = True
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(12, 18, 12, 18)
+        sidebar_layout.setSpacing(6)
+
+        sidebar_header = QHBoxLayout()
+        sidebar_header.setContentsMargins(0, 0, 0, 0)
+        workspace_label = QLabel('工作空间')
+        workspace_label.setObjectName('workspaceLabel')
+        self.workspace_label = workspace_label
+        sidebar_header.addWidget(workspace_label)
+        sidebar_header.addStretch(1)
+        self.sidebar_toggle = QToolButton()
+        self.sidebar_toggle.setObjectName('sidebarToggle')
+        self.sidebar_toggle.setFixedSize(28, 28)
+        self.sidebar_toggle.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.sidebar_toggle.setText('\u2039')
+        self.sidebar_toggle.setToolTip('收缩导航栏')
+        self.sidebar_toggle.clicked.connect(self._toggle_sidebar)
+        sidebar_header.addWidget(self.sidebar_toggle)
+        sidebar_layout.addLayout(sidebar_header)
+
+        self.nav_buttons = []
+        self._nav_labels = ('整机控制', '电机管理', '传感器', '部署中心')
+        for index, text in enumerate(self._nav_labels):
+            button = QPushButton(text)
+            button.setObjectName('navButton')
+            button.setCheckable(True)
+            button.setMinimumHeight(38)
+            button.setToolTip(text)
+            button.clicked.connect(lambda checked=False, page=index: self._set_page(page))
+            self.nav_buttons.append(button)
+            sidebar_layout.addWidget(button)
+        sidebar_layout.addStretch(1)
+        side_footer = QLabel('OpenFlex VR 全身控制上位机\nROS 后台进程统一管理')
+        side_footer.setObjectName('sideFooter')
+        side_footer.setWordWrap(True)
+        self.side_footer = side_footer
+        sidebar_layout.addWidget(side_footer)
+        body_layout.addWidget(sidebar)
+
+        self.page_stack = QStackedWidget()
+        self.page_stack.setObjectName('pageStack')
+        body_layout.addWidget(self.page_stack, 1)
+
+        self.page_stack.addWidget(self._scroll_page(self._build_control_page()))
+        self.motor_page = self._build_motor_management_page()
+        self.page_stack.addWidget(self.motor_page)
+        self.page_stack.addWidget(self._scroll_page(self._build_sensors_page()))
+        self.page_stack.addWidget(self._scroll_page(self._build_deploy_page()))
+        self._set_page(0)
+
+        self._refresh_can_ui_state()
+
+    def _toggle_sidebar(self):
+        self._set_sidebar_collapsed(self.sidebar_expanded)
+
+    def _set_sidebar_collapsed(self, collapsed: bool):
+        self.sidebar_expanded = not collapsed
+        self.sidebar.setFixedWidth(218 if self.sidebar_expanded else 52)
+        self.workspace_label.setVisible(self.sidebar_expanded)
+        self.sidebar_toggle.setText('\u2039' if self.sidebar_expanded else '\u203a')
+        self.sidebar_toggle.setToolTip(
+            '收缩导航栏' if self.sidebar_expanded else '展开导航栏'
+        )
+        self.side_footer.setVisible(self.sidebar_expanded)
+        for label, button in zip(self._nav_labels, self.nav_buttons):
+            button.setVisible(self.sidebar_expanded)
+            button.setText(label)
+            button.setToolTip(label)
+
+    def _set_page(self, index: int):
+        if index == 1 and self.deployment_runner and self.deployment_runner.is_running:
+            self._log_err('部署任务运行期间不可进入电机管理')
+            return
+        if self.page_stack.currentIndex() == 1 and index != 1:
+            self._release_motor_management()
+        if index == 1:
+            self._activate_motor_management()
+        self.page_stack.setCurrentIndex(index)
+        for button_index, button in enumerate(self.nav_buttons):
+            button.setChecked(button_index == index)
+
+    def _release_motor_management(self):
+        old_adapter = self.motor_manager_adapter
+        old_page = self.motor_page
+        if old_adapter is not None:
+            old_adapter.shutdown()
+
+        replacement = self._build_motor_management_page()
+        self.page_stack.removeWidget(old_page)
+        self.page_stack.insertWidget(1, replacement)
+        self.motor_page = replacement
+        old_page.deleteLater()
+        self._log('已退出电机维护模式并释放直接硬件连接')
+
+    def _activate_motor_management(self):
+        adapter = self.motor_manager_adapter
+        if adapter is None:
+            return
+        processes = (self._proc_bringup, self._proc_vr)
+        if any(
+            proc is not None and proc.state() != QProcess.NotRunning
+            for proc in processes
+        ):
+            self._log_err('电机管理暂不可用：请先停止整机控制和 VR 遥操作')
+            self._update_motor_page_lock()
+            return
+        try:
+            adapter.initialize_controller()
+            # The embedded manager's legacy UIController may apply its own
+            # persisted theme during controller construction. The host theme
+            # is authoritative for the embedded page, so restore it here.
+            adapter.set_theme(self.theme_manager.current_theme)
+            self.motor_page.setEnabled(True)
+            self.motor_page.setToolTip('')
+        except Exception as exc:
+            self.motor_page.setEnabled(False)
+            self.motor_page.setToolTip(f'电机控制器初始化失败: {exc}')
+            self._log_err(f'电机控制器初始化失败: {exc}')
+
+    def _build_motor_management_page(self) -> QWidget:
+        manager_dir = os.path.join(
+            _SRC_DIR, 'openflex_integrated', 'openflex_manager'
+        )
+        try:
+            adapter = self._motor_adapter_factory(manager_dir)
+            adapter.set_theme(self.theme_manager.current_theme)
+            page = adapter.create_page()
+            if hasattr(page, 'btn_theme_toggle'):
+                page.btn_theme_toggle.hide()
+            self.motor_manager_adapter = adapter
+            return page
+        except Exception as exc:
+            self.motor_manager_adapter = None
+            self._log_err(f'电机管理加载失败: {exc}')
+            error_page = self._placeholder_page(
+                '电机管理不可用',
+                f'无法加载 {manager_dir}\n{exc}',
+            )
+            error_page.setObjectName('motorManagementErrorPage')
+            return error_page
+
+    @staticmethod
+    def _scroll_page(page: QWidget) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setObjectName('pageScroll')
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(page)
+        return scroll
+
+    @staticmethod
+    def _placeholder_page(title: str, description: str) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(28, 26, 28, 28)
+        heading = QLabel(title)
+        heading.setFont(QFont('Sans', 18, QFont.Bold))
+        layout.addWidget(heading)
+        layout.addWidget(QLabel(description))
+        layout.addStretch(1)
+        return page
+
+    def _apply_theme(self):
+        stylesheet = """
+            QMainWindow, QWidget#appRoot {
+                background: #eef2f7;
+                color: #1b2839;
+                font-family: "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+                font-size: 12px;
+            }
+            QFrame#topBar {
+                background: #ffffff;
+                border-bottom: 1px solid #d4deea;
+            }
+            QLabel#brandIcon {
+                background: #ffffff;
+                border: 1px solid #d4deea;
+                border-radius: 6px;
+            }
+            QLabel#appTitle {
+                color: #1b2839;
+                font-size: 16px;
+                font-weight: 700;
+            }
+            QLabel#healthStatus {
+                color: #16836e;
+                font-size: 11px;
+                font-weight: 700;
+            }
+            QLabel#platformLabel, QLabel#sideFooter, QLabel#pageSubtitle,
+            QLabel#panelCopy, QLabel#cardCopy, QLabel#controlStepCopy {
+                color: #708096;
+            }
+            QLabel#avatar {
+                background: #e7edf7;
+                color: #34527f;
+                border-radius: 14px;
+                font-size: 10px;
+                font-weight: 700;
+            }
+            QToolButton#themeToggleButton {
+                background: transparent;
+                color: #53647a;
+                border: 1px solid #d4deea;
+                border-radius: 5px;
+                font-size: 17px;
+                font-weight: 600;
+            }
+            QToolButton#themeToggleButton:hover {
+                background: #f2f5fa;
+            }
+            QToolButton#sidebarToggle {
+                background: transparent;
+                color: #53647a;
+                border: 1px solid #d4deea;
+                border-radius: 5px;
+                font-size: 18px;
+                font-weight: 600;
+                padding: 0;
+            }
+            QToolButton#sidebarToggle:hover {
+                background: #f2f5fa;
+            }
+            QFrame#sideBar {
+                background: #ffffff;
+                border-right: 1px solid #d4deea;
+            }
+            QLabel#workspaceLabel {
+                color: #8592a4;
+                font-size: 10px;
+                font-weight: 700;
+                padding: 0 8px 6px 8px;
+            }
+            QLabel#sideFooter {
+                font-size: 10px;
+                line-height: 1.5;
+                padding: 10px 8px;
+            }
+            QPushButton#navButton {
+                background: transparent;
+                color: #607087;
+                border: none;
+                border-radius: 5px;
+                text-align: left;
+                padding-left: 14px;
+                font-weight: 500;
+            }
+            QPushButton#navButton:hover {
+                background: #f2f5fa;
+            }
+            QPushButton#navButton:checked {
+                background: #e8efff;
+                color: #1751c6;
+                font-weight: 700;
+            }
+            QPushButton#navButton[sidebarCollapsed="true"] {
+                text-align: center;
+                padding-left: 0px;
+                padding-right: 0px;
+            }
+            QStackedWidget#pageStack, QScrollArea#pageScroll,
+            QScrollArea#pageScroll > QWidget > QWidget {
+                background: #eef2f7;
+                border: none;
+            }
+            QLabel#pageTitle {
+                color: #1b2839;
+                font-size: 27px;
+                font-weight: 700;
+            }
+            QFrame#controlWorkflow, QFrame#vrCard, QFrame#videoTransferCard, QFrame#sensorCard {
+                background: #ffffff;
+                border: 1px solid #d4deea;
+                border-radius: 7px;
+            }
+            QLabel#deploymentEyebrow {
+                color: #708096;
+                font-size: 10px;
+                letter-spacing: 1px;
+            }
+            QFrame#deploymentTaskCard, QFrame#deploymentActions {
+                background: #ffffff;
+                border: 1px solid #d4deea;
+                border-radius: 7px;
+            }
+            QFrame#deploymentTaskCard[selected="true"] {
+                background: #f7faff;
+                border-color: #9ebbe9;
+            }
+            QLabel#deploymentCardTitle {
+                color: #1b2839;
+                font-size: 13px;
+                font-weight: 700;
+            }
+            QLabel#deploymentCardFlag {
+                color: #708096;
+                font-family: "JetBrains Mono", "Noto Sans Mono", monospace;
+                font-size: 10px;
+            }
+            QLabel#deploymentCardCopy {
+                color: #6b7d93;
+                font-size: 10px;
+            }
+            QLabel#deploymentCardStatus {
+                color: #16836e;
+                font-size: 10px;
+                font-weight: 700;
+            }
+            QFrame#panelHeader {
+                background: #ffffff;
+                border: none;
+                border-bottom: 1px solid #dbe5f1;
+            }
+            QPushButton#handModeButton {
+                min-width: 58px;
+                min-height: 28px;
+                padding: 0 10px;
+                background: #ffffff;
+                color: #284568;
+                border: 1px solid #b9c8da;
+                border-radius: 7px;
+                font-size: 11px;
+                font-weight: 700;
+            }
+            QPushButton#handModeButton:hover {
+                background: #f1f6ff;
+                border-color: #6f96cf;
+                color: #1751c6;
+            }
+            QPushButton#handModeButton:checked {
+                background: #eaf1ff;
+                border-color: #81a4db;
+                color: #1751c6;
+            }
+            QFrame#controlStep {
+                background: #ffffff;
+                border: none;
+                border-bottom: 1px solid #dbe5f1;
+            }
+            QFrame#controlStep[primaryStep="true"] {
+                background: #f7faff;
+            }
+            QLabel#panelTitle, QLabel#cardTitle, QLabel#logTitle {
+                color: #1b2839;
+                font-size: 15px;
+                font-weight: 700;
+            }
+            QLabel#kicker {
+                color: #7358a5;
+                font-size: 10px;
+                font-weight: 700;
+            }
+            QLabel#stepNumber {
+                background: #e8efff;
+                color: #1751c6;
+                border-radius: 15px;
+                font-weight: 700;
+            }
+            QPushButton {
+                min-height: 34px;
+                padding: 0 12px;
+                background: #ffffff;
+                color: #41526a;
+                border: 1px solid #d4deea;
+                border-radius: 5px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: #f2f5fa;
+            }
+            QPushButton:disabled, QToolButton:disabled {
+                color: #a0acbb;
+                background: #eef1f5;
+                border-color: #dce3eb;
+            }
+            QPushButton[variant="primary"] {
+                background: #1e5bd3;
+                color: #ffffff;
+                border-color: #1e5bd3;
+            }
+            QPushButton[variant="primary"]:hover {
+                background: #174fb9;
+            }
+            QPushButton#videoSourceButton:checked {
+                background: #1e5bd3;
+                color: #ffffff;
+                border-color: #1e5bd3;
+            }
+            QPushButton#videoSourceButton:checked:hover {
+                background: #174fb9;
+            }
+            QPushButton[variant="danger"], QToolButton[variant="danger"] {
+                background: #f6e6e6;
+                color: #ad3838;
+                border: 1px solid #eed3d3;
+                border-radius: 5px;
+            }
+            QPushButton[variant="text"] {
+                background: transparent;
+                border: none;
+                color: #8fa4bb;
+                padding: 0 5px;
+            }
+            QPushButton[variant="primary"]:disabled,
+            QPushButton[variant="danger"]:disabled,
+            QPushButton[variant="secondary"]:disabled,
+            QToolButton[variant="danger"]:disabled {
+                color: #a0acbb;
+                background: #eef1f5;
+                border-color: #dce3eb;
+            }
+            QCheckBox {
+                color: #53647a;
+                spacing: 7px;
+            }
+            QComboBox {
+                min-height: 34px;
+                padding: 0 10px;
+                color: #33465f;
+                background: #ffffff;
+                border: 1px solid #cbd7e5;
+                border-radius: 5px;
+            }
+            QLabel#deploymentStatus {
+                color: #176f60;
+                font-weight: 700;
+            }
+            QTextEdit#deploymentLog {
+                background: #172235;
+                color: #b9f3d2;
+                border: 1px solid #263750;
+                border-radius: 7px;
+                padding: 10px;
+                font-family: "JetBrains Mono", "Noto Sans Mono", monospace;
+            }
+            QFrame#runtimeLogCard {
+                background: #172235;
+                border: 1px solid #263750;
+                border-radius: 7px;
+            }
+            QFrame#runtimeLogCard QLabel#logTitle {
+                color: #f2f6fb;
+            }
+            QTextEdit#runtimeLog {
+                background: #172235;
+                color: #70dca5;
+                border: none;
+                selection-background-color: #31527e;
+            }
+            QFrame#sensorLogCard {
+                background: #172235;
+                border: 1px solid #263750;
+                border-radius: 7px;
+            }
+            QFrame#sensorLogCard QLabel#sensorLogTitle {
+                color: #f2f6fb;
+            }
+            QTextEdit#sensorLog {
+                background: #172235;
+                color: #70dca5;
+                border: none;
+                selection-background-color: #31527e;
+            }
+            QSplitter::handle {
+                background: transparent;
+                width: 12px;
+            }
+            QScrollBar:vertical {
+                width: 10px;
+                background: #e7edf4;
+                border: none;
+            }
+            QScrollBar::handle:vertical {
+                min-height: 28px;
+                background: #aebccd;
+                border-radius: 5px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
+            }
+        """
+        if self.theme_manager.current_theme == 'night':
+            stylesheet += """
+                QMainWindow, QWidget#appRoot {
+                    background: #111827;
+                    color: #e7edf5;
+                }
+                QFrame#topBar, QFrame#sideBar,
+                QFrame#controlWorkflow, QFrame#vrCard, QFrame#videoTransferCard, QFrame#sensorCard,
+                QFrame#panelHeader,
+                QFrame#controlStep, QFrame#controlStep[primaryStep="true"],
+                QFrame#deploymentTaskCard, QFrame#deploymentActions {
+                    background: #182235;
+                    border-color: #2c3a4f;
+                }
+                QFrame#deploymentTaskCard[selected="true"] {
+                    background: #1e304d;
+                    border-color: #4b79c5;
+                }
+                QFrame#topBar {
+                    border-bottom-color: #2c3a4f;
+                }
+                QFrame#sideBar {
+                    border-right-color: #2c3a4f;
+                }
+                QFrame#panelHeader, QFrame#controlStep {
+                    border-bottom-color: #2c3a4f;
+                }
+                QPushButton#handModeButton {
+                    background: #182235;
+                    color: #c8d7ed;
+                    border-color: #50627d;
+                }
+                QPushButton#handModeButton:hover {
+                    background: #20385f;
+                    border-color: #7199d4;
+                    color: #9cc0ff;
+                }
+                QPushButton#handModeButton:checked {
+                    background: #20385f;
+                    border-color: #7199d4;
+                    color: #9cc0ff;
+                }
+                QLabel#brandIcon {
+                    background: #202c40;
+                    border-color: #38485f;
+                }
+                QLabel#appTitle, QLabel#pageTitle, QLabel#panelTitle,
+                QLabel#cardTitle, QLabel#controlStepTitle, QLabel#statusText {
+                    color: #edf3fa;
+                }
+                QFrame#runtimeLogCard QLabel#logTitle {
+                    color: #f2f6fb;
+                }
+                QLabel#platformLabel, QLabel#sideFooter, QLabel#pageSubtitle,
+                QLabel#panelCopy, QLabel#cardCopy, QLabel#controlStepCopy,
+                QCheckBox, QLabel#deploymentEyebrow, QLabel#deploymentCardFlag,
+                QLabel#deploymentCardCopy {
+                    color: #9eacc0;
+                }
+                QLabel#deploymentCardTitle {
+                    color: #edf3fa;
+                }
+                QComboBox {
+                    color: #d9e3ef;
+                    background: #111a29;
+                    border-color: #3a4a61;
+                }
+                QLabel#deploymentStatus {
+                    color: #70dca5;
+                }
+                QLabel#workspaceLabel {
+                    color: #8290a5;
+                }
+                QLabel#avatar {
+                    background: #29364b;
+                    color: #c9d7ea;
+                }
+                QPushButton#navButton {
+                    color: #aab7c9;
+                }
+                QPushButton#navButton:hover {
+                    background: #202c40;
+                }
+                QPushButton#navButton:checked {
+                    background: #20385f;
+                    color: #8eb5ff;
+                }
+                QToolButton#sidebarToggle {
+                    color: #c9d7ea;
+                    border-color: #3a4a61;
+                }
+                QToolButton#sidebarToggle:hover {
+                    background: #202c40;
+                }
+                QStackedWidget#pageStack, QScrollArea#pageScroll,
+                QScrollArea#pageScroll > QWidget > QWidget {
+                    background: #111827;
+                }
+                QLabel#stepNumber {
+                    background: #233c65;
+                    color: #a8c6ff;
+                }
+                QPushButton, QToolButton#themeToggleButton {
+                    background: #202c40;
+                    color: #d9e3ef;
+                    border-color: #3a4a61;
+                }
+                QPushButton:hover, QToolButton#themeToggleButton:hover {
+                    background: #29374d;
+                }
+                QPushButton:disabled, QToolButton:disabled {
+                    color: #657287;
+                    background: #192233;
+                    border-color: #2b374a;
+                }
+                QPushButton[variant="primary"] {
+                    background: #3574e8;
+                    border-color: #3574e8;
+                    color: #ffffff;
+                }
+                QPushButton[variant="primary"]:hover {
+                    background: #2866d5;
+                }
+                QPushButton[variant="danger"], QToolButton[variant="danger"] {
+                    background: #46282f;
+                    color: #ffb4b4;
+                    border-color: #69404a;
+                }
+                QPushButton[variant="text"] {
+                    background: transparent;
+                    color: #9eb0c7;
+                    border: none;
+                }
+                QScrollBar:vertical {
+                    background: #182235;
+                }
+                QScrollBar::handle:vertical {
+                    background: #53627a;
+                }
+            """
+        self.setStyleSheet(stylesheet)
+        self._update_theme_button()
+        if self.motor_manager_adapter is not None:
+            self.motor_manager_adapter.set_theme(self.theme_manager.current_theme)
+
+    def _toggle_theme(self):
+        self.theme_manager.toggle()
+        self._apply_theme()
+
+    def _update_theme_button(self):
+        switching_to_night = self.theme_manager.current_theme == 'day'
+        self.btn_theme.setIcon(QIcon())
+        self.btn_theme.setText('☾' if switching_to_night else '☀')
+        self.btn_theme.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.btn_theme.setToolTip(
+            '切换到夜间模式' if switching_to_night else '切换到日间模式'
+        )
+
+    def _build_control_page(self) -> QWidget:
+        page = QWidget()
+        page.setObjectName('controlPage')
+        root = QVBoxLayout(page)
+        root.setContentsMargins(28, 24, 28, 28)
+        root.setSpacing(18)
+
+        title = QLabel('整机控制')
+        title.setObjectName('pageTitle')
+        title.setFont(QFont('Sans', 22, QFont.Bold))
+        subtitle = QLabel('按启动顺序完成 CAN、执行器检查，再启动整机控制。')
+        subtitle.setObjectName('pageSubtitle')
+        root.addWidget(title)
+        root.addWidget(subtitle)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        self.control_splitter = splitter
+        self._control_layout_vertical = False
+        root.addWidget(splitter, 1)
+
+        workflow = QFrame()
+        workflow.setObjectName('controlWorkflow')
+        workflow.setMinimumWidth(430)
+        workflow_layout = QVBoxLayout(workflow)
+        workflow_layout.setContentsMargins(0, 0, 0, 0)
+        workflow_layout.setSpacing(0)
+
+        workflow_header = QFrame()
+        workflow_header.setObjectName('panelHeader')
+        workflow_header_layout = QHBoxLayout(workflow_header)
+        workflow_header_layout.setContentsMargins(20, 17, 20, 16)
+        workflow_header_layout.setSpacing(12)
+        workflow_title_layout = QVBoxLayout()
+        workflow_title_layout.setContentsMargins(0, 0, 0, 0)
+        workflow_title_layout.setSpacing(5)
+        workflow_title = QLabel('整机控制')
+        workflow_title.setObjectName('panelTitle')
+        workflow_title.setFont(QFont('Sans', 15, QFont.Bold))
+        workflow_copy = QLabel('按顺序准备底层接口、执行器和控制器')
+        workflow_copy.setObjectName('panelCopy')
+        workflow_title_layout.addWidget(workflow_title)
+        workflow_title_layout.addWidget(workflow_copy)
+        workflow_header_layout.addLayout(workflow_title_layout)
+        workflow_header_layout.addStretch(1)
+        workflow_layout.addWidget(workflow_header)
+
+        self.dot_can = StatusDot()
+        self.btn_enable_can = self._button('启用全部 CAN', 'primary')
+        self.btn_enable_can.clicked.connect(self._on_enable_can)
+        self.btn_disable_can = self._button('禁用全部', 'danger')
+        self.btn_disable_can.clicked.connect(self._on_disable_can)
+        workflow_layout.addWidget(self._build_control_step(
+            '1', 'CAN 总线', '先启用并确认 can0–can5 接口', self.dot_can,
+            (self.btn_enable_can, self.btn_disable_can),
+            {'idle': '待启动', 'running': '通道在线', 'error': '接口异常'},
+        ))
+
+        self.dot_status = StatusDot()
+        self.btn_status = self._button('检查全部状态', 'secondary')
+        self.btn_status.clicked.connect(self._on_check_status)
+        workflow_layout.addWidget(self._build_control_step(
+            '2', '电机状态', '检查全部控制器、节点和电机反馈', self.dot_status,
+            (self.btn_status,),
+            {'idle': '待检查', 'running': '检查中', 'error': '状态异常'},
+        ))
+
+        self.dot_bringup = StatusDot()
+        self.btn_bringup_start = self._button('启动整机控制', 'primary')
+        self.btn_bringup_start.clicked.connect(self._on_start_bringup)
+        self.btn_hand_mode = self._button('夹爪', 'secondary')
+        self.btn_hand_mode.setObjectName('handModeButton')
+        self.btn_hand_mode.setCheckable(True)
+        self.btn_hand_mode.setToolTip('切换为灵巧手模式')
+        self.btn_hand_mode.toggled.connect(self._on_hand_mode_toggled)
+        workflow_header_layout.addWidget(self.btn_hand_mode, 0, Qt.AlignTop)
+        self.btn_bringup_stop = self._button('停止整机', 'danger')
+        self.btn_bringup_stop.setEnabled(False)
+        self.btn_bringup_stop.clicked.connect(self._on_stop_bringup)
+        self.btn_bringup_vr_start = self._button('启动整机控制+VR', 'primary')
+        self.btn_bringup_vr_start.clicked.connect(self._on_start_bringup_vr)
+        self.btn_bringup_vr_stop = self._button('停止整机控制+VR', 'danger')
+        self.btn_bringup_vr_stop.setEnabled(False)
+        self.btn_bringup_vr_stop.clicked.connect(self._on_stop_bringup_vr)
+        workflow_layout.addWidget(self._build_control_step(
+            '3', '启动整机控制', '加载全部控制器并进入可操作状态', self.dot_bringup,
+            (
+                self.btn_bringup_start,
+                self.btn_bringup_stop,
+                self.btn_bringup_vr_start,
+                self.btn_bringup_vr_stop,
+            ),
+            {'idle': '待启动', 'running': '运行中', 'error': '启动异常'},
+            primary=True,
+        ))
+        # Keep the workflow card at its content height; spare column space
+        # belongs below the cards so the VR panel stays directly underneath.
+
+        left_column = QFrame()
+        left_column.setObjectName('controlLeftColumn')
+        left_column.setMinimumWidth(430)
+        left_column_layout = QVBoxLayout(left_column)
+        left_column_layout.setContentsMargins(0, 0, 0, 0)
+        left_column_layout.setSpacing(12)
+        left_column_layout.addWidget(workflow)
+
+        right_column = QFrame()
+        right_column.setObjectName('controlRightColumn')
+        right_column.setMinimumWidth(280)
+        right_column_layout = QVBoxLayout(right_column)
+        right_column_layout.setContentsMargins(0, 0, 0, 0)
+        right_column_layout.setSpacing(0)
+
+        vr_card = QFrame()
+        vr_card.setObjectName('vrCard')
+        vr_layout = QVBoxLayout(vr_card)
+        vr_layout.setContentsMargins(18, 17, 18, 18)
+        vr_layout.setSpacing(9)
+        vr_kicker = QLabel('OPENXR')
+        vr_kicker.setObjectName('kicker')
+        vr_title = QLabel('VR 遥操作')
+        vr_title.setObjectName('cardTitle')
+        vr_copy = QLabel('启动 VR 控制，并选择是否接收底盘速度。')
+        vr_copy.setObjectName('cardCopy')
+        vr_copy.setWordWrap(True)
+        self.dot_vr = StatusDot()
+        vr_status_row = QHBoxLayout()
+        vr_status = QLabel()
+        vr_status.setObjectName('statusText')
+        self.dot_vr.bind_status_label(vr_status, {
+            'idle': '设备待启动',
+            'running': '运行中',
+            'error': '连接异常',
+        })
+        vr_status_row.addWidget(self.dot_vr)
+        vr_status_row.addWidget(vr_status)
+        vr_status_row.addStretch(1)
+        self.chk_vr_chassis = QCheckBox('VR 控制底盘速度')
+        self.chk_vr_chassis.setChecked(True)
+        self.chk_vr_chassis.setToolTip('勾选后使用 VR 发来的底盘线速度/角速度上限')
+        self.btn_vr_start = self._button('启动 VR', 'primary')
+        self.btn_vr_start.clicked.connect(self._on_start_vr)
+        self.btn_vr_stop = self._button('停止', 'secondary')
+        self.btn_vr_stop.setEnabled(False)
+        self.btn_vr_stop.clicked.connect(self._on_stop_vr)
+        vr_actions = QHBoxLayout()
+        vr_actions.addWidget(self.btn_vr_start)
+        vr_actions.addWidget(self.btn_vr_stop)
+        vr_actions.addStretch(1)
+        vr_layout.addWidget(vr_kicker)
+        vr_layout.addWidget(vr_title)
+        vr_layout.addWidget(vr_copy)
+        vr_layout.addLayout(vr_status_row)
+        vr_layout.addWidget(self.chk_vr_chassis)
+        vr_layout.addLayout(vr_actions)
+        left_column_layout.addWidget(vr_card)
+
+        video_card = QFrame()
+        video_card.setObjectName('videoTransferCard')
+        video_layout = QVBoxLayout(video_card)
+        video_layout.setContentsMargins(18, 15, 18, 16)
+        video_layout.setSpacing(8)
+        video_title = QLabel('图传功能')
+        video_title.setObjectName('cardTitle')
+        video_copy = QLabel('选择要发送到 VR 的相机画面，再启动图传。')
+        video_copy.setObjectName('cardCopy')
+        video_copy.setWordWrap(True)
+        self.dot_video = StatusDot()
+        video_status_row = QHBoxLayout()
+        video_status = QLabel()
+        video_status.setObjectName('statusText')
+        self.dot_video.bind_status_label(video_status, {
+            'idle': '图传待启动',
+            'running': '图传运行中',
+            'error': '图传异常',
+        })
+        video_status_row.addWidget(self.dot_video)
+        video_status_row.addWidget(video_status)
+        video_status_row.addStretch(1)
+
+        source_row = QHBoxLayout()
+        source_row.setSpacing(7)
+        self.btn_video_head = self._button('头部图传', 'secondary')
+        self.btn_video_left = self._button('左手图传', 'secondary')
+        self.btn_video_right = self._button('右手图传', 'secondary')
+        for button in (self.btn_video_head, self.btn_video_left, self.btn_video_right):
+            button.setObjectName('videoSourceButton')
+            button.setCheckable(True)
+            button.setChecked(False)
+            source_row.addWidget(button)
+
+        video_actions = QHBoxLayout()
+        self.btn_video_start = self._button('启动图传', 'primary')
+        self.btn_video_start.clicked.connect(self._on_start_video)
+        self.btn_video_stop = self._button('停止图传', 'danger')
+        self.btn_video_stop.setEnabled(False)
+        self.btn_video_stop.clicked.connect(self._on_stop_video)
+        video_actions.addWidget(self.btn_video_start)
+        video_actions.addWidget(self.btn_video_stop)
+        video_actions.addStretch(1)
+        video_layout.addWidget(video_title)
+        video_layout.addWidget(video_copy)
+        video_layout.addLayout(video_status_row)
+        video_layout.addLayout(source_row)
+        video_layout.addLayout(video_actions)
+        left_column_layout.addWidget(video_card)
+        left_column_layout.addStretch(1)
+        self._control_left_layout = left_column_layout
+        self._control_left_stretch_item = left_column_layout.takeAt(
+            left_column_layout.count() - 1
+        )
+        left_column_layout.addItem(self._control_left_stretch_item)
+        self._control_left_stretch_added = True
+
+        log_card = QFrame()
+        log_card.setObjectName('runtimeLogCard')
+        log_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        log_layout = QVBoxLayout(log_card)
+        log_layout.setContentsMargins(15, 14, 15, 15)
+        log_header = QHBoxLayout()
+        log_title = QLabel('运行诊断')
+        log_title.setObjectName('logTitle')
+        log_title.setMinimumWidth(72)
+        btn_clear = self._button('清空', 'text')
+        log_header.addWidget(log_title)
+        log_header.addStretch(1)
+        self.btn_control_layout = QToolButton()
+        self.btn_control_layout.setObjectName('controlLayoutToggle')
+        self.btn_control_layout.setFixedSize(34, 30)
+        self.btn_control_layout.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self.btn_control_layout.clicked.connect(self._toggle_control_layout)
+        log_header.addWidget(self.btn_control_layout)
+        log_header.addWidget(btn_clear)
+        self.log_view = QTextEdit()
+        self.log_view.setObjectName('runtimeLog')
+        self.log_view.setReadOnly(True)
+        self.log_view.document().setMaximumBlockCount(3000)
+        self.log_view.setFont(QFont('Monospace', 13))
+        self.log_view.setTextColor(QColor('#70dca5'))
+        self.log_view.setMinimumHeight(220)
+        btn_clear.clicked.connect(self.log_view.clear)
+        log_layout.addLayout(log_header)
+        log_layout.addWidget(self.log_view, 1)
+        right_column_layout.addWidget(log_card, 1)
+        splitter.addWidget(left_column)
+        splitter.addWidget(right_column)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+        self._apply_control_layout(False)
+        return page
+
+    def _apply_control_layout(self, vertical: bool):
+        self._control_layout_vertical = vertical
+        self.control_splitter.setOrientation(
+            Qt.Vertical if vertical else Qt.Horizontal
+        )
+        if vertical:
+            if self._control_left_stretch_added:
+                self._control_left_stretch_item = self._control_left_layout.takeAt(
+                    self._control_left_layout.count() - 1
+                )
+                self._control_left_stretch_added = False
+            self._control_left_layout.activate()
+            content_height = self._control_left_layout.sizeHint().height()
+            self.control_splitter.setSizes([
+                content_height,
+                max(0, self.control_splitter.height() - content_height),
+            ])
+            self.btn_control_layout.setIcon(self._layout_icon(
+                'view-split-left-right', QStyle.SP_FileDialogListView
+            ))
+            self.btn_control_layout.setToolTip('切换为左右布局')
+        else:
+            if not self._control_left_stretch_added:
+                self._control_left_layout.addItem(
+                    self._control_left_stretch_item
+                )
+                self._control_left_stretch_added = True
+            self.control_splitter.setSizes([500, 576])
+            self.btn_control_layout.setIcon(self._layout_icon(
+                'view-split-top-bottom', QStyle.SP_FileDialogDetailedView
+            ))
+            self.btn_control_layout.setToolTip('切换为上下布局')
+
+    def _layout_icon(self, theme_name: str, fallback: QStyle.StandardPixmap) -> QIcon:
+        icon = QIcon.fromTheme(theme_name)
+        if not icon.isNull():
+            return icon
+        return self.style().standardIcon(fallback)
+
+    def _toggle_control_layout(self):
+        self._apply_control_layout(not self._control_layout_vertical)
+
+    def _build_sensors_page(self) -> QWidget:
+        page = QWidget()
+        page.setObjectName('sensorsPage')
+        root = QVBoxLayout(page)
+        root.setContentsMargins(28, 24, 28, 28)
+        root.setSpacing(16)
+
+        title = QLabel('传感器')
+        title.setObjectName('pageTitle')
+        title.setFont(QFont('Sans', 22, QFont.Bold))
+        subtitle = QLabel('查看 RealSense 相机和 Livox MID360S 激光雷达。')
+        subtitle.setObjectName('pageSubtitle')
+        root.addWidget(title)
+        root.addWidget(subtitle)
+
+        camera_card = QFrame()
+        camera_card.setObjectName('sensorCard')
+        camera_layout = QVBoxLayout(camera_card)
+        camera_layout.setContentsMargins(20, 18, 20, 20)
+        camera_layout.setSpacing(10)
+        camera_title = QLabel('RealSense 相机')
+        camera_title.setObjectName('cardTitle')
+        camera_copy = QLabel('启动四路 RGB ROS2/RViz2 视图，或打开独立 RealSense Viewer。')
+        camera_copy.setObjectName('cardCopy')
+        camera_copy.setWordWrap(True)
+        camera_actions = QHBoxLayout()
+        camera_actions.setSpacing(8)
+        self.btn_camera_ros = self._button('相机查看 · ROS2', 'primary')
+        self.btn_camera_ros.setToolTip('启动四路 RGB 相机并在 RViz2 中显示')
+        self.btn_camera_ros.clicked.connect(self._on_start_camera_ros)
+        self.btn_camera = self._button('相机查看 · Viewer', 'secondary')
+        self.btn_camera.clicked.connect(self._on_start_camera_viewer)
+        self.btn_camera_stop = QToolButton()
+        self.btn_camera_stop.setProperty('variant', 'danger')
+        self.btn_camera_stop.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
+        self.btn_camera_stop.setFixedSize(40, 40)
+        self.btn_camera_stop.setToolTip('停止当前 RealSense 相机查看')
+        self.btn_camera_stop.setEnabled(False)
+        self.btn_camera_stop.clicked.connect(self._on_stop_camera_viewer)
+        camera_actions.addWidget(self.btn_camera_ros)
+        camera_actions.addWidget(self.btn_camera)
+        camera_actions.addWidget(self.btn_camera_stop)
+        camera_actions.addStretch(1)
+        camera_layout.addWidget(camera_title)
+        camera_layout.addWidget(camera_copy)
+        camera_layout.addLayout(camera_actions)
+        root.addWidget(camera_card)
+
+        lidar_card = QFrame()
+        lidar_card.setObjectName('sensorCard')
+        lidar_layout = QVBoxLayout(lidar_card)
+        lidar_layout.setContentsMargins(20, 18, 20, 20)
+        lidar_layout.setSpacing(10)
+        lidar_title = QLabel('Livox MID360S')
+        lidar_title.setObjectName('cardTitle')
+        lidar_copy = QLabel('启动 Livox ROS2 驱动并打开对应 RViz2 配置。')
+        lidar_copy.setObjectName('cardCopy')
+        lidar_actions = QHBoxLayout()
+        lidar_actions.setSpacing(8)
+        self.btn_lidar = self._button('启动激光雷达查看器', 'primary')
+        self.btn_lidar.clicked.connect(self._on_start_lidar_viewer)
+        self.btn_lidar_stop = self._button('停止', 'danger')
+        self.btn_lidar_stop.setEnabled(False)
+        self.btn_lidar_stop.clicked.connect(self._on_stop_lidar_viewer)
+        lidar_actions.addWidget(self.btn_lidar)
+        lidar_actions.addWidget(self.btn_lidar_stop)
+        lidar_actions.addStretch(1)
+        lidar_layout.addWidget(lidar_title)
+        lidar_layout.addWidget(lidar_copy)
+        lidar_layout.addLayout(lidar_actions)
+        root.addWidget(lidar_card)
+
+        sensor_log_card = QFrame()
+        sensor_log_card.setObjectName('sensorLogCard')
+        sensor_log_layout = QVBoxLayout(sensor_log_card)
+        sensor_log_layout.setContentsMargins(15, 14, 15, 15)
+        sensor_log_header = QHBoxLayout()
+        sensor_log_title = QLabel('传感器日志')
+        sensor_log_title.setObjectName('sensorLogTitle')
+        sensor_log_clear = self._button('清空', 'text')
+        self.sensor_log_view = QTextEdit()
+        self.sensor_log_view.setObjectName('sensorLog')
+        self.sensor_log_view.setReadOnly(True)
+        self.sensor_log_view.document().setMaximumBlockCount(3000)
+        self.sensor_log_view.setFont(QFont('Monospace', 12))
+        self.sensor_log_view.setMinimumHeight(180)
+        self.sensor_log_view.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        sensor_log_card.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        sensor_log_clear.clicked.connect(self.sensor_log_view.clear)
+        sensor_log_header.addWidget(sensor_log_title)
+        sensor_log_header.addStretch(1)
+        sensor_log_header.addWidget(sensor_log_clear)
+        sensor_log_layout.addLayout(sensor_log_header)
+        sensor_log_layout.addWidget(self.sensor_log_view, 1)
+        root.addWidget(sensor_log_card, 1)
+        return page
+
+    def _build_deploy_page(self) -> QWidget:
+        page = QWidget()
+        page.setObjectName('deployPage')
+        root = QVBoxLayout(page)
+        root.setContentsMargins(28, 24, 28, 28)
+        root.setSpacing(12)
+
+        heading = QVBoxLayout()
+        eyebrow = QLabel('Workspace / Installer')
+        eyebrow.setObjectName('deploymentEyebrow')
+        title = QLabel('部署中心')
+        title.setObjectName('pageTitle')
+        title.setFont(QFont('Sans', 22, QFont.Bold))
+        subtitle = QLabel('对应 install_openflex_drivers_and_build.sh 的全部安装与编译入口。')
+        subtitle.setObjectName('pageSubtitle')
+        subtitle.setWordWrap(True)
+        heading.addWidget(eyebrow)
+        heading.addWidget(title)
+        heading.addWidget(subtitle)
+        root.addLayout(heading)
+
+        cards = QWidget()
+        cards.setObjectName('deploymentCardGrid')
+        card_grid = QGridLayout(cards)
+        card_grid.setContentsMargins(0, 0, 0, 0)
+        card_grid.setHorizontalSpacing(10)
+        card_grid.setVerticalSpacing(10)
+        self.deployment_card_buttons = []
+        self.deployment_card_statuses = {}
+        self._deployment_task_id = next(iter(DEPLOYMENT_TASKS))
+        for index, task in enumerate(DEPLOYMENT_TASKS.values()):
+            card = QFrame()
+            card.setObjectName('deploymentTaskCard')
+            card.setProperty('taskId', task.task_id)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(14, 13, 14, 13)
+            card_layout.setSpacing(7)
+
+            card_title = QLabel(task.label)
+            card_title.setObjectName('deploymentCardTitle')
+            flag = QLabel(task.script_flag)
+            flag.setObjectName('deploymentCardFlag')
+            copy = QLabel(task.risk)
+            copy.setObjectName('deploymentCardCopy')
+            copy.setWordWrap(True)
+            card_footer = QHBoxLayout()
+            status = QLabel('待执行')
+            status.setObjectName('deploymentCardStatus')
+            status.setProperty('state', 'idle')
+            run_button = self._button('执行', 'primary')
+            run_button.setObjectName(f'deploymentRunButton_{task.task_id.replace("-", "_")}')
+            run_button.clicked.connect(
+                lambda checked=False, task_id=task.task_id: self._on_deployment_card_run(task_id)
+            )
+            card_footer.addWidget(status)
+            card_footer.addStretch(1)
+            card_footer.addWidget(run_button)
+            card_layout.addWidget(card_title)
+            card_layout.addWidget(flag)
+            card_layout.addWidget(copy, 1)
+            card_layout.addLayout(card_footer)
+            card_grid.addWidget(card, index // 2, index % 2)
+            self.deployment_card_buttons.append(run_button)
+            self.deployment_card_statuses[task.task_id] = status
+        card_grid.setColumnStretch(0, 1)
+        card_grid.setColumnStretch(1, 1)
+        root.addWidget(cards)
+
+        options = QFrame()
+        options.setObjectName('deploymentActions')
+        options_layout = QVBoxLayout(options)
+        options_layout.setContentsMargins(14, 12, 14, 12)
+        options_layout.setSpacing(9)
+
+        action_row = QHBoxLayout()
+        self.btn_deployment_cancel = self._button('取消任务', 'danger')
+        self.btn_deployment_cancel.setEnabled(False)
+        self.deployment_status = QLabel('待执行')
+        self.deployment_status.setObjectName('deploymentStatus')
+        action_row.addWidget(self.btn_deployment_cancel)
+        action_row.addStretch(1)
+        action_row.addWidget(self.deployment_status)
+        options_layout.addLayout(action_row)
+
+        root.addWidget(options)
+
+        log_header = QLabel('部署日志')
+        log_header.setObjectName('cardTitle')
+        self.deployment_log = QTextEdit()
+        self.deployment_log.setObjectName('deploymentLog')
+        self.deployment_log.setReadOnly(True)
+        self.deployment_log.document().setMaximumBlockCount(3000)
+        self.deployment_log.setFont(QFont('Monospace', 13))
+        self.deployment_log.setMinimumHeight(220)
+
+        self.deployment_command_builder = DeploymentCommandBuilder(
+            _DEPLOYMENT_SCRIPT, _WORKSPACE_DIR
+        )
+        self.deployment_runner = self._deployment_runner_factory(
+            self.deployment_command_builder
+        )
+        self._deployment_dialog = None
+        self._sudo_prompt_shown = False
+        self.deployment_runner.output.connect(self._on_deployment_output)
+        self.deployment_runner.state_changed.connect(self._on_deployment_state_changed)
+        self.deployment_runner.finished.connect(self._on_deployment_finished)
+        self.btn_deployment_cancel.clicked.connect(self.deployment_runner.cancel)
+
+        root.addWidget(log_header)
+        root.addWidget(self.deployment_log, 1)
+        return page
+
+    def _select_deployment_task(self, task_id: str):
+        if task_id not in DEPLOYMENT_TASKS:
+            return False
+        self._deployment_task_id = task_id
+        for card in self.findChildren(QFrame, 'deploymentTaskCard'):
+            selected = card.property('taskId') == task_id
+            card.setProperty('selected', selected)
+            card.style().unpolish(card)
+            card.style().polish(card)
+        return True
+
+    def _on_deployment_card_run(self, task_id: str):
+        self._select_deployment_task(task_id)
+        self._on_deployment_run()
+
+    def _selected_deployment_task_id(self) -> str:
+        return self._deployment_task_id
+
+    def _on_deployment_run(self):
+        task_id = self._selected_deployment_task_id()
+        task = DEPLOYMENT_TASKS[task_id]
+        conflict = self._deployment_conflict_reason()
+        if conflict:
+            self._on_deployment_output(f'[无法启动] {conflict}\n')
+            self.deployment_status.setText('存在运行冲突')
+            return
+        config_dialog = DeploymentConfigDialog(task_id, self)
+        self._deployment_dialog = config_dialog
+        config_dialog.configuration_ready.connect(
+            lambda configuration, task_id=task_id, dialog=config_dialog:
+            self._start_deployment_from_dialog(task_id, configuration, dialog)
+        )
+        config_dialog.cancel_execution.connect(self.deployment_runner.cancel)
+        config_dialog.sudo_password_submitted.connect(self.deployment_runner.send_input)
+        try:
+            config_dialog.exec()
+        except Exception as exc:
+            self._on_deployment_output(f'[弹窗失败] {exc}\n')
+        finally:
+            if self._deployment_dialog is config_dialog:
+                self._deployment_dialog = None
+
+    def _start_deployment_from_dialog(self, task_id: str, configuration: dict, dialog):
+        try:
+            self.deployment_runner.start(
+                task_id,
+                dry_run=False,
+                input_lines=configuration.get('input_lines', []),
+            )
+        except Exception as exc:
+            self._on_deployment_output(f'[启动失败] {exc}\n')
+            dialog.show_execution_result(False, -1)
+
+    def _on_deployment_output(self, text: str):
+        if (
+            self.deployment_runner.is_running
+            and not self._sudo_prompt_shown
+            and re.search(r"(?:password|密码).*[:：]", text, re.IGNORECASE)
+        ):
+            self._prompt_for_sudo_password()
+        cursor = self.deployment_log.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(text)
+        self.deployment_log.setTextCursor(cursor)
+        self.deployment_log.ensureCursorVisible()
+        if self._deployment_dialog is not None:
+            update_output = getattr(self._deployment_dialog, "update_execution_output", None)
+            if update_output is not None:
+                update_output(text)
+
+    def _prompt_for_sudo_password(self):
+        self._sudo_prompt_shown = True
+        if self._deployment_dialog is not None:
+            self._deployment_dialog.show_sudo_prompt()
+
+    def _on_deployment_state_changed(self, state: str):
+        labels = {
+            'running': '执行中',
+            'success': '执行成功',
+            'failed': '执行失败',
+            'cancelled': '已取消',
+        }
+        running = state == 'running'
+        if not running:
+            self._sudo_prompt_shown = False
+        self.deployment_status.setText(labels.get(state, state))
+        self.btn_deployment_cancel.setEnabled(running)
+        if self.deployment_card_buttons:
+            for button in self.deployment_card_buttons:
+                button.setEnabled(not running)
+        active_task = self.deployment_runner.active_task if running else None
+        for task_id, status_label in self.deployment_card_statuses.items():
+            status_label.setText(
+                '执行中' if task_id == active_task else labels.get(state, '待执行') if task_id == self._selected_deployment_task_id() else '待执行'
+            )
+        self._set_robot_actions_locked_for_deployment(running)
+
+    def _on_deployment_finished(self, task_id: str, exit_code: int, success: bool):
+        task = DEPLOYMENT_TASKS.get(task_id)
+        label = task.label if task else task_id
+        result = '完成' if success else '失败'
+        self._on_deployment_output(f'\n[{label}] {result}，退出码 {exit_code}\n')
+        if self._deployment_dialog is not None:
+            detail = ""
+            if not success:
+                detail = getattr(self.deployment_runner, "output_tail", "").strip()[-1600:]
+            self._deployment_dialog.show_execution_result(success, exit_code, detail)
+
+    @staticmethod
+    def _process_is_running(process) -> bool:
+        return process is not None and process.state() != QProcess.NotRunning
+
+    def _deployment_conflict_reason(self) -> str | None:
+        if self._motor_maintenance_active():
+            return '电机管理仍占用直接硬件连接，请先退出电机管理'
+        process_labels = (
+            (self._proc_bringup, '整机控制仍在运行'),
+            (self._proc_vr, 'VR 遥操作仍在运行'),
+            (self._proc_video, '图传仍在运行'),
+            (self._proc_camera_ros, 'RealSense ROS 任务仍在运行'),
+            (self._proc_camera, 'RealSense Viewer 仍在运行'),
+            (self._proc_lidar, 'Livox 查看任务仍在运行'),
+        )
+        for process, reason in process_labels:
+            if self._process_is_running(process):
+                return reason
+        return None
+
+    def _deployment_runtime_widgets(self):
+        return (
+            self.btn_enable_can,
+            self.btn_disable_can,
+            self.btn_status,
+            self.btn_hand_mode,
+            self.btn_bringup_start,
+            self.btn_bringup_stop,
+            self.btn_bringup_vr_start,
+            self.btn_bringup_vr_stop,
+            self.btn_vr_start,
+            self.btn_vr_stop,
+            self.btn_video_head,
+            self.btn_video_left,
+            self.btn_video_right,
+            self.btn_video_start,
+            self.btn_video_stop,
+            self.btn_camera_ros,
+            self.btn_camera,
+            self.btn_camera_stop,
+            self.btn_lidar,
+            self.btn_lidar_stop,
+            self.nav_buttons[1],
+            self.motor_page,
+        )
+
+    def _set_robot_actions_locked_for_deployment(self, locked: bool):
+        widgets = self._deployment_runtime_widgets()
+        if locked and self._deployment_locked_states is None:
+            self._deployment_locked_states = {
+                widget: widget.isEnabled() for widget in widgets
+            }
+            for widget in widgets:
+                widget.setEnabled(False)
+        elif not locked and self._deployment_locked_states is not None:
+            for widget, was_enabled in self._deployment_locked_states.items():
+                widget.setEnabled(was_enabled)
+            self._deployment_locked_states = None
+
+    def _deployment_blocks_action(self, action: str) -> bool:
+        if self.deployment_runner and self.deployment_runner.is_running:
+            self._log_err(f'部署任务运行期间不可{action}')
+            return True
+        return False
+
+    @staticmethod
+    def _button(text: str, variant: str) -> QPushButton:
+        button = QPushButton(text)
+        button.setProperty('variant', variant)
+        button.setMinimumHeight(36)
+        return button
+
+    @staticmethod
+    def _build_control_step(number: str, title: str, description: str,
+                            dot: StatusDot, buttons: tuple,
+                            state_texts: dict,
+                            primary: bool = False) -> QFrame:
+        step = QFrame()
+        step.setObjectName('controlStep')
+        step.setProperty('primaryStep', primary)
+        step.setMinimumHeight(196 if primary else 116)
+        if primary:
+            step.setMinimumWidth(430)
+        layout = QHBoxLayout(step)
+        layout.setContentsMargins(20, 15, 20, 15)
+        layout.setSpacing(14)
+
+        number_label = QLabel(number)
+        number_label.setObjectName('stepNumber')
+        number_label.setAlignment(Qt.AlignCenter)
+        number_label.setFixedSize(30, 30)
+        layout.addWidget(number_label, 0, Qt.AlignTop)
+
+        copy_layout = QVBoxLayout()
+        copy_layout.setSpacing(4)
+        title_label = QLabel(title)
+        title_label.setObjectName('controlStepTitle')
+        title_label.setFont(QFont('Sans', 11, QFont.Bold))
+        description_label = QLabel(description)
+        description_label.setObjectName('controlStepCopy')
+        description_label.setWordWrap(True)
+        status_layout = QHBoxLayout()
+        status_layout.setSpacing(6)
+        status_label = QLabel()
+        status_label.setObjectName('statusText')
+        dot.bind_status_label(status_label, state_texts)
+        status_layout.addWidget(dot)
+        status_layout.addWidget(status_label)
+        status_layout.addStretch(1)
+        copy_layout.addWidget(title_label)
+        copy_layout.addWidget(description_label)
+        copy_layout.addLayout(status_layout)
+
+        layout.addWidget(number_label, 0, Qt.AlignTop)
+        layout.addLayout(copy_layout, 1)
+        actions = QVBoxLayout()
+        actions.setSpacing(6)
+        for button in buttons:
+            button.setFixedWidth(154)
+            button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            actions.addWidget(button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        return step
+
+    # ── 日志 ─────────────────────────────────────────────────────
+    def _append_log(self, text: str):
+        self.log_view.append(text)
+        self.log_view.moveCursor(QTextCursor.End)
+
+    def _append_log_html(self, html: str):
+        self.log_view.append(html)
+        self.log_view.moveCursor(QTextCursor.End)
+
+    def _log(self, msg: str):
+        """线程安全日志"""
+        self._signals.log.emit(msg)
+
+    def _log_ok(self, msg: str):
+        self._signals.log_html.emit(f'<span style="color:#2ecc71">{msg}</span>')
+
+    def _log_err(self, msg: str):
+        self._signals.log_html.emit(f'<span style="color:#e74c3c">{msg}</span>')
+
+    def _call_ui(self, callback):
+        self._signals.ui.emit(callback)
+
+    @staticmethod
+    def _run_ui_callback(callback):
+        callback()
+
+    # ── 1. CAN 总线 ─────────────────────────────────────────────
+    def _on_enable_can(self):
+        if self._deployment_blocks_action('启用 CAN'):
+            return
+        self._start_enable_can()
+
+    def _start_enable_can(self, start_sequence: bool = False):
+        self._start_sequence_after_can = start_sequence
+        if start_sequence:
+            self._auto_start_vr_pending = False
+        self._set_can_buttons_enabled(False, False)
+        self.dot_can.set_state('running')
+        threading.Thread(target=self._enable_can_worker, daemon=True).start()
+
+    def _enable_can_worker(self):
+        self._log('=' * 50)
+        self._log('启用全部 CAN 通道...')
+        if not os.path.exists(_CAN_HELPER):
+            self._log_err(f'CAN helper 不存在: {_CAN_HELPER}')
+            self._start_sequence_after_can = False
+            self._call_ui(self._refresh_can_ui_state)
+            return
+
+        try:
+            ret = subprocess.run(
+                ['bash', _CAN_HELPER],
+                capture_output=True, text=True, timeout=60
+            )
+        except subprocess.TimeoutExpired:
+            self._log_err('CAN helper 执行超时')
+            self._start_sequence_after_can = False
+            self._call_ui(self._refresh_can_ui_state)
+            return
+        except Exception as e:
+            self._log_err(f'执行 CAN helper 异常: {e}')
+            self._start_sequence_after_can = False
+            self._call_ui(self._refresh_can_ui_state)
+            return
+
+        output = (ret.stdout or '').strip()
+        err_output = (ret.stderr or '').strip()
+        if output:
+            for line in output.splitlines():
+                self._log(line)
+        if err_output:
+            for line in err_output.splitlines():
+                self._log_err(line)
+
+        if ret.returncode == 0:
+            self._log_ok('全部 CAN 通道已启用')
+            self._signals.log.emit('')  # trigger UI update
+            self._call_ui(self._refresh_can_ui_state)
+            if self._start_sequence_after_can:
+                self._log('CAN 已就绪，继续启动整机控制...')
+                self._call_ui(self._start_bringup_then_wait_for_vr)
+        else:
+            self._log_err(f'CAN helper 退出失败 (code={ret.returncode})')
+            self._call_ui(self._refresh_can_ui_state)
+
+        self._start_sequence_after_can = False
+
+    def _on_disable_can(self):
+        if self._deployment_blocks_action('禁用 CAN'):
+            return
+        self._auto_start_vr_pending = False
+        self._start_sequence_after_can = False
+        self._set_can_buttons_enabled(False, False)
+        self.dot_can.set_state('running')
+        threading.Thread(target=self._disable_can_worker, daemon=True).start()
+
+    def _disable_can_worker(self):
+        self._log('=' * 50)
+        self._log('禁用全部 CAN 通道...')
+        if not os.path.exists(_DISABLE_CAN_HELPER):
+            self._log_err(f'CAN disable helper 不存在: {_DISABLE_CAN_HELPER}')
+            self._call_ui(self._refresh_can_ui_state)
+            return
+
+        try:
+            ret = subprocess.run(
+                ['bash', _DISABLE_CAN_HELPER],
+                capture_output=True, text=True, timeout=60
+            )
+        except subprocess.TimeoutExpired:
+            self._log_err('CAN disable helper 执行超时')
+            self._call_ui(self._refresh_can_ui_state)
+            return
+        except Exception as e:
+            self._log_err(f'执行 CAN disable helper 异常: {e}')
+            self._call_ui(self._refresh_can_ui_state)
+            return
+
+        output = (ret.stdout or '').strip()
+        err_output = (ret.stderr or '').strip()
+        if output:
+            for line in output.splitlines():
+                self._log(line)
+        if err_output:
+            for line in err_output.splitlines():
+                self._log_err(line)
+
+        if ret.returncode == 0:
+            self._log_ok('全部 CAN 通道已禁用')
+        else:
+            self._log_err(f'CAN disable helper 退出失败 (code={ret.returncode})')
+        self._call_ui(self._refresh_can_ui_state)
+
+    def _set_can_buttons_enabled(self, enable_allowed: bool, disable_allowed: bool):
+        self.btn_enable_can.setEnabled(enable_allowed)
+        self.btn_disable_can.setEnabled(disable_allowed)
+
+    def _refresh_can_ui_state(self):
+        existing = [iface for iface in ROBOT_CAN_CONFIG if self._iface_exists(iface)]
+        up_ifaces = [iface for iface in existing if self._iface_up(iface)]
+
+        if not existing:
+            self.dot_can.set_state('error')
+            self._set_can_buttons_enabled(False, False)
+        elif len(up_ifaces) == len(existing):
+            self.dot_can.set_state('running')
+            self._set_can_buttons_enabled(False, True)
+        elif up_ifaces:
+            self.dot_can.set_state('error')
+            self._set_can_buttons_enabled(True, True)
+        else:
+            self.dot_can.set_state('idle')
+            self._set_can_buttons_enabled(True, False)
+
+    # ── 2. 检查电机状态 ──────────────────────────────────────────
+    def _on_check_status(self):
+        if self._deployment_blocks_action('检查电机状态'):
+            return
+        self.btn_status.setEnabled(False)
+        self.dot_status.set_state('running')
+        threading.Thread(target=self._check_status_worker, daemon=True).start()
+
+    def _check_status_worker(self):
+        self._log('=' * 50)
+        self._log('检查全部电机状态...')
+
+        # 使用 check_motor_status.py 脚本（不依赖 openflex_driver 包）
+        script_path = os.path.join(
+            _SRC_DIR, 'openflex_integrated', 'openflex_manager', 'scripts', 'check_motor_status.py'
+        )
+
+        if not os.path.exists(script_path):
+            self._log_err(f'脚本不存在: {script_path}')
+            self._call_ui(lambda: self.dot_status.set_state('idle'))
+            self._call_ui(lambda: self.btn_status.setEnabled(True))
+            return
+
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['python3', script_path],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            # 输出脚本结果
+            if result.stdout:
+                self._log(result.stdout.rstrip())
+            if result.stderr:
+                self._log_err(result.stderr.rstrip())
+
+            all_ok = (result.returncode == 0)
+        except subprocess.TimeoutExpired:
+            self._log_err('检查超时（30秒）')
+            all_ok = False
+        except Exception as e:
+            self._log_err(f'执行脚本异常: {e}')
+            all_ok = False
+
+        self._log('')
+        if all_ok:
+            self._log_ok('全部电机状态正常')
+        else:
+            self._log_err('部分电机状态异常或无响应')
+
+        self._call_ui(lambda: self.dot_status.set_state('idle'))
+        self._call_ui(lambda: self.btn_status.setEnabled(True))
+
+    @staticmethod
+    def _iface_exists(iface: str) -> bool:
+        ret = subprocess.run(
+            ['ip', 'link', 'show', iface],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return ret.returncode == 0
+
+    @staticmethod
+    def _iface_up(iface: str) -> bool:
+        ret = subprocess.run(
+            ['ip', 'link', 'show', iface],
+            capture_output=True,
+            text=True,
+        )
+        if ret.returncode != 0:
+            return False
+        first_line = ret.stdout.splitlines()[0] if ret.stdout else ''
+        flags_start = first_line.find('<')
+        flags_end = first_line.find('>', flags_start + 1)
+        if flags_start == -1 or flags_end == -1:
+            return False
+        flags = first_line[flags_start + 1:flags_end].split(',')
+        return 'UP' in flags
+
+    def _set_combined_buttons(self, start_enabled: bool, stop_enabled: bool):
+        self.btn_bringup_vr_start.setEnabled(start_enabled)
+        self.btn_bringup_vr_stop.setEnabled(stop_enabled)
+
+    def _finish_combined_workflow(self):
+        self._auto_start_vr_pending = False
+        self._combined_start_active = False
+        self._combined_bringup_owned = False
+        self._combined_vr_owned = False
+        self._combined_stop_pending = False
+        self._set_combined_buttons(True, False)
+
+    def _begin_combined_ready_poll(self, bringup_owned: bool):
+        self._combined_start_active = True
+        self._combined_bringup_owned = bringup_owned
+        self._combined_vr_owned = False
+        self._combined_stop_pending = False
+        self._auto_start_vr_pending = True
+        self._set_combined_buttons(False, True)
+        QTimer.singleShot(COMBINED_VR_START_DELAY_MS, self._start_combined_vr_after_delay)
+
+    def _start_combined_vr_after_delay(self):
+        """Start the paired VR process after the fixed startup delay."""
+        if not self._auto_start_vr_pending:
+            return
+
+        if self._proc_vr and self._proc_vr.state() != QProcess.NotRunning:
+            self._auto_start_vr_pending = False
+            self._finish_combined_workflow()
+            return
+
+        if self._proc_bringup is None or self._proc_bringup.state() == QProcess.NotRunning:
+            self._log_err('整机控制未保持运行，已取消自动启动 VR')
+            self._finish_combined_workflow()
+            return
+
+        self._log_ok('整机控制已启动，等待 4 秒后自动启动 VR 遥操作')
+        self._auto_start_vr_pending = False
+        self._on_start_vr()
+        if self._proc_vr and self._proc_vr.state() != QProcess.NotRunning:
+            self._combined_vr_owned = True
+        else:
+            self._finish_combined_workflow()
+
+    def _on_start_bringup_vr(self):
+        if self._deployment_blocks_action('启动整机控制+VR'):
+            return
+        if self._combined_start_active:
+            self._log('整机控制+VR 已在启动或运行中')
+            return
+        if self._proc_vr and self._proc_vr.state() != QProcess.NotRunning:
+            self._log('VR 遥操作已在运行中，请使用独立按钮管理')
+            return
+
+        if self._proc_bringup and self._proc_bringup.state() != QProcess.NotRunning:
+            self._log('整机控制已在运行中，开始等待控制器就绪...')
+            self._begin_combined_ready_poll(bringup_owned=False)
+            return
+
+        self._on_start_bringup()
+        if self._proc_bringup is None or self._proc_bringup.state() == QProcess.NotRunning:
+            self._finish_combined_workflow()
+            return
+        self._begin_combined_ready_poll(bringup_owned=True)
+
+    def _start_bringup_then_wait_for_vr(self):
+        """Compatibility entry point for a combined start without CAN orchestration."""
+        self._on_start_bringup_vr()
+
+    def _motor_maintenance_active(self) -> bool:
+        return bool(
+            self.motor_manager_adapter is not None
+            and self.motor_manager_adapter.has_active_connection()
+        )
+
+    def _update_motor_page_lock(self):
+        processes = (self._proc_bringup, self._proc_vr)
+        locked = any(
+            proc is not None and proc.state() != QProcess.NotRunning
+            for proc in processes
+        )
+        self.btn_hand_mode.setEnabled(
+            not locked
+            and not self._combined_start_active
+            and self._deployment_locked_states is None
+        )
+        if self.motor_page is not None:
+            self.motor_page.setEnabled(not locked)
+            self.motor_page.setToolTip(
+                '整机控制或 VR 运行期间不可使用直接电机管理'
+                if locked else ''
+            )
+
+    def _on_hand_mode_toggled(self, enabled: bool):
+        self._o6_mode = bool(enabled)
+        if self._o6_mode:
+            self.btn_hand_mode.setText('灵巧手')
+            self.btn_hand_mode.setToolTip('切换为夹爪模式')
+        else:
+            self.btn_hand_mode.setText('夹爪')
+            self.btn_hand_mode.setToolTip('切换为灵巧手模式')
+
+    # ── 3. 整机控制 ──────────────────────────────────────────────
+    def _on_start_bringup(self):
+        if self._deployment_blocks_action('启动整机控制'):
+            return
+        if self._proc_bringup and self._proc_bringup.state() != QProcess.NotRunning:
+            self._log('整机控制已在运行中')
+            return
+
+        if self._motor_maintenance_active():
+            self._log_err('整机控制启动已取消：电机管理仍有直接硬件连接，请先断开')
+            self.dot_bringup.set_state('error')
+            return
+
+        unavailable_can = [
+            iface for iface in ROBOT_CAN_CONFIG
+            if not self._iface_exists(iface) or not self._iface_up(iface)
+        ]
+        if unavailable_can:
+            self._log_err(
+                '整机控制启动已取消，请先启用全部 CAN。'
+                f'未就绪通道: {", ".join(unavailable_can)}'
+            )
+            self.dot_bringup.set_state('error')
+            return
+
+        self._log('=' * 50)
+        self._log('启动整机控制...')
+
+        bringup_launch = (
+            'integrated_robot_o6_bringup.launch.py'
+            if self._o6_mode else 'integrated_robot_bringup.launch.py'
+        )
+        cmd = (
+            f'source {_SETUP_BASH} && '
+            f'ros2 launch openarmx_integrated_bringup {bringup_launch} '
+            'use_fake_hardware:=false '
+            'chassis_steering_can:=can5 '
+            'chassis_driving_can:=can4 '
+            'left_arm_can:=can1 '
+            'right_arm_can:=can0 '
+            'lift_can:=can3 '
+            'lift_node_id:=16 '
+            'head_can:=can2 '
+            'use_rviz:=true'
+        )
+
+        self._proc_bringup = self._launch_process(
+            cmd, self.dot_bringup, self.btn_bringup_start, self.btn_bringup_stop, '整机控制'
+        )
+        if self._proc_bringup.state() != QProcess.NotRunning:
+            self._update_motor_page_lock()
+            self._start_battery_monitor()
+
+    def _battery_node_is_running(self) -> bool:
+        cmd = f'source {_SETUP_BASH} && ros2 node list'
+        try:
+            ret = subprocess.run(
+                ['bash', '-c', cmd],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return False
+        if ret.returncode != 0:
+            return False
+        battery_node_names = {
+            'jd_battery_node',
+            'jd_battery_multi_node',
+            'jd_battery_master_dual_node',
+        }
+        return any(
+            name.rstrip('/').rsplit('/', 1)[-1] in battery_node_names
+            for name in ret.stdout.splitlines()
+        )
+
+    def _start_battery_monitor(self):
+        if self._proc_battery and self._proc_battery.state() != QProcess.NotRunning:
+            self._log('电池监控已由本界面启动')
+            return
+        if self._battery_node_is_running():
+            self._log_ok('检测到电池监控节点已在运行，继续使用现有节点')
+            return
+
+        self._log('启动电池监控...')
+        cmd = (
+            f'source {_SETUP_BASH} && '
+            'ros2 launch openarmx_battery_monitor auto_pack_overlay.launch.py '
+            'start_rviz:=false '
+            'fix_serial_permission:=false'
+        )
+        proc = QProcess(self)
+        proc.setProcessChannelMode(QProcess.MergedChannels)
+        proc.readyReadStandardOutput.connect(lambda: self._on_proc_output(proc))
+        proc.finished.connect(
+            lambda code, status: self._on_battery_finished(proc, code, status)
+        )
+        self._proc_battery = proc
+        self._battery_stop_requested = False
+        proc.start('setsid', ['--wait', 'bash', '-c', cmd])
+        if not proc.waitForStarted(5000):
+            self._log_err('电池监控启动失败，整机控制将继续运行')
+            self._proc_battery = None
+        else:
+            self._log_ok(f'电池监控已启动 (PID: {proc.processId()})')
+
+    def _stop_battery_monitor(self):
+        proc = self._proc_battery
+        if (
+            proc is None
+            or proc.state() == QProcess.NotRunning
+            or self._battery_stop_requested
+        ):
+            return
+        self._battery_stop_requested = True
+        self._log('正在停止电池监控...')
+        pid = proc.processId()
+        if pid:
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGINT)
+            except (ProcessLookupError, PermissionError):
+                proc.terminate()
+        else:
+            proc.terminate()
+        QTimer.singleShot(FORCE_STOP_TIMEOUT_MS, lambda: self._force_kill(proc, '电池监控'))
+
+    def _on_battery_finished(self, proc: QProcess, code, status):
+        if self._proc_battery is proc:
+            self._proc_battery = None
+        was_stopping = self._battery_stop_requested
+        self._battery_stop_requested = False
+        if code == 0 or was_stopping:
+            self._log('电池监控已退出')
+        else:
+            self._log_err(f'电池监控退出 (code={code})，整机控制继续运行')
+
+    def _on_stop_bringup(self):
+        self._auto_start_vr_pending = False
+        # 先失能底盘（controller_manager 还在），再杀 bringup 进程
+        self._log('正在失能底盘...')
+        self._deactivate_chassis(then_stop_bringup=True)
+
+    def _deactivate_chassis(self, then_stop_bringup=False):
+        """通过 ros2 control 将底盘控制器切为 inactive，停止电机并关闭 CAN"""
+        cmd = (
+            f'source {_SETUP_BASH} && '
+            'ros2 control set_controller_state swerve_drive_controller inactive && '
+            'ros2 control set_hardware_component_state swerve_drive_system inactive'
+        )
+        proc = subprocess.Popen(
+            ['bash', '-c', cmd],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        threading.Thread(
+            target=self._wait_deactivate, args=(proc, then_stop_bringup),
+            daemon=True
+        ).start()
+
+    def _wait_deactivate(self, proc, then_stop_bringup):
+        try:
+            _, stderr = proc.communicate(timeout=DEACTIVATE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            self._signals.log.emit('[ERR] 底盘失能超时')
+            if then_stop_bringup:
+                self._call_ui(self._do_stop_bringup)
+            return
+
+        if proc.returncode == 0:
+            self._signals.log.emit('[OK] 底盘已失能')
+        else:
+            err = stderr.decode(errors='replace').strip()
+            self._signals.log.emit(f'[ERR] 底盘失能失败: {err}')
+
+        if then_stop_bringup:
+            self._call_ui(self._do_stop_bringup)
+
+    def _do_stop_bringup(self):
+        self._stop_battery_monitor()
+        if (
+            self._combined_stop_pending
+            and (
+                self._proc_bringup is None
+                or self._proc_bringup.state() == QProcess.NotRunning
+            )
+        ):
+            self._finish_combined_workflow()
+            return
+        self._stop_process(self._proc_bringup, self.dot_bringup,
+                           self.btn_bringup_start, self.btn_bringup_stop, '整机控制')
+
+    def _stop_owned_combined_bringup(self):
+        if not self._combined_bringup_owned:
+            self._finish_combined_workflow()
+            return
+        proc = self._proc_bringup
+        if proc is None or proc.state() == QProcess.NotRunning:
+            self._finish_combined_workflow()
+            return
+        self._log('正在失能组合启动的底盘...')
+        self._deactivate_chassis(then_stop_bringup=True)
+
+    def _on_stop_bringup_vr(self):
+        if not self._combined_start_active:
+            self._log('整机控制+VR 未在运行')
+            return
+        self._auto_start_vr_pending = False
+        self._combined_stop_pending = True
+        self._set_combined_buttons(False, False)
+        if self._combined_vr_owned:
+            proc = self._proc_vr
+            if proc and proc.state() != QProcess.NotRunning:
+                self._stop_process(
+                    proc, self.dot_vr, self.btn_vr_start, self.btn_vr_stop,
+                    '组合启动的 VR 遥操作'
+                )
+                return
+            self._combined_vr_owned = False
+        self._stop_owned_combined_bringup()
+
+    # ── 4. VR 遥操作 ─────────────────────────────────────────────
+    def _on_start_vr(self):
+        if self._deployment_blocks_action('启动 VR 遥操作'):
+            return
+        self._auto_start_vr_pending = False
+        if self._proc_vr and self._proc_vr.state() != QProcess.NotRunning:
+            self._log('VR 遥操作已在运行中')
+            return
+
+
+        if self._motor_maintenance_active():
+            self._log_err('VR 遥操作启动已取消：电机管理仍有直接硬件连接，请先断开')
+            self.dot_vr.set_state('error')
+            return
+
+        self._log('=' * 50)
+        self._log('启动 VR 遥操作...')
+
+        vr_chassis = 'true' if self.chk_vr_chassis.isChecked() else 'false'
+        cmd = (
+            f'source {_SETUP_BASH} && '
+            'ros2 launch openarmx_integrated_bringup integrated_vr_teleop.launch.py '
+            f'vr_chassis:={vr_chassis}'
+        )
+
+        self._proc_vr = self._launch_process(
+            cmd, self.dot_vr, self.btn_vr_start, self.btn_vr_stop, 'VR 遥操作'
+        )
+        if self._proc_vr.state() != QProcess.NotRunning:
+            self._update_motor_page_lock()
+
+    def _on_stop_vr(self):
+        self._auto_start_vr_pending = False
+        self._stop_process(self._proc_vr, self.dot_vr,
+                           self.btn_vr_start, self.btn_vr_stop, 'VR 遥操作')
+
+    # ── 4.1 VR 图传 ──────────────────────────────────────────────
+    def _set_video_source_buttons_enabled(self, enabled: bool):
+        for button in (self.btn_video_head, self.btn_video_left, self.btn_video_right):
+            button.setEnabled(enabled)
+
+    def _on_start_video(self):
+        if self._deployment_blocks_action('启动图传'):
+            return
+        if self._proc_video and self._proc_video.state() != QProcess.NotRunning:
+            self._log('图传已在运行中')
+            return
+
+        selected = {
+            'enable_head_video': self.btn_video_head.isChecked(),
+            'enable_left_hand_video': self.btn_video_left.isChecked(),
+            'enable_right_hand_video': self.btn_video_right.isChecked(),
+        }
+        if not any(selected.values()):
+            self._log_err('图传启动已取消：请至少选择一个图传源')
+            self.dot_video.set_state('error')
+            return
+
+        self._log('=' * 50)
+        self._log('启动图传...')
+        cmd = (
+            f'source {_SETUP_BASH} && '
+            'ros2 launch openarmx_head_vision_h264 d435i_vr.launch.py '
+            f"enable_head_video:={'true' if selected['enable_head_video'] else 'false'} "
+            'enable_hand_video:=false '
+            f"enable_left_hand_video:={'true' if selected['enable_left_hand_video'] else 'false'} "
+            f"enable_right_hand_video:={'true' if selected['enable_right_hand_video'] else 'false'}"
+        )
+        self._set_video_source_buttons_enabled(False)
+        self._proc_video = self._launch_process(
+            cmd, self.dot_video, self.btn_video_start, self.btn_video_stop, '图传'
+        )
+        if self._proc_video.state() == QProcess.NotRunning:
+            self._set_video_source_buttons_enabled(True)
+
+    def _on_stop_video(self):
+        self._stop_process(self._proc_video, self.dot_video,
+                           self.btn_video_start, self.btn_video_stop, '图传')
+
+    # ── 5. 传感器检测 (Ultra版) ────────────────────────────────────
+    def _camera_process_running(self) -> bool:
+        return any(
+            proc is not None and proc.state() != QProcess.NotRunning
+            for proc in (self._proc_camera_ros, self._proc_camera)
+        )
+
+    def _set_camera_buttons_enabled(self, enabled: bool):
+        self.btn_camera_ros.setEnabled(enabled)
+        self.btn_camera.setEnabled(enabled)
+        self.btn_camera_stop.setEnabled(not enabled)
+
+    @staticmethod
+    def _terminate_camera_process(proc: QProcess, process_group: bool):
+        if proc.state() == QProcess.NotRunning:
+            return
+        if process_group and proc.processId() > 0:
+            try:
+                os.killpg(os.getpgid(proc.processId()), signal.SIGTERM)
+                return
+            except ProcessLookupError:
+                return
+            except OSError:
+                pass
+        proc.terminate()
+
+    @staticmethod
+    def _force_stop_camera_process(proc: QProcess, process_group: bool):
+        if proc.state() == QProcess.NotRunning:
+            return
+        if process_group and proc.processId() > 0:
+            try:
+                os.killpg(os.getpgid(proc.processId()), signal.SIGKILL)
+                return
+            except ProcessLookupError:
+                return
+            except OSError:
+                pass
+        proc.kill()
+
+    def _on_stop_camera_viewer(self):
+        processes = (
+            (self._proc_camera_ros, True),
+            (self._proc_camera, False),
+        )
+        active = [
+            (proc, process_group)
+            for proc, process_group in processes
+            if proc is not None and proc.state() != QProcess.NotRunning
+        ]
+        if not active:
+            self._set_camera_buttons_enabled(True)
+            return
+
+        self._log('正在停止 RealSense 相机查看...')
+        self._sensor_log('正在停止 RealSense 相机查看...')
+        self.btn_camera_stop.setEnabled(False)
+        for proc, process_group in active:
+            self._terminate_camera_process(proc, process_group)
+            QTimer.singleShot(
+                FORCE_STOP_TIMEOUT_MS,
+                lambda proc=proc, process_group=process_group:
+                    self._force_stop_camera_process(proc, process_group),
+            )
+
+    def _on_start_camera_ros(self):
+        if self._deployment_blocks_action('启动 RealSense ROS'):
+            return
+        if self._camera_process_running():
+            self._log('已有 RealSense 查看器在运行；请先关闭其窗口')
+            return
+        if not os.path.exists(_CAMERA_CONFIG):
+            self._log_err(f'相机配置不存在: {_CAMERA_CONFIG}')
+            return
+
+        self._log('=' * 50)
+        self._log('启动四路 RealSense RGB 与 RViz2...')
+        self._sensor_log('启动四路 RealSense RGB 与 RViz2...')
+        self._set_camera_buttons_enabled(False)
+        cmd = (
+            f'source {shlex.quote(_SETUP_BASH)} && '
+            'ros2 launch openarmx_lerobot camera_rgb_viewer.launch.py '
+            f'camera_config:={shlex.quote(_CAMERA_CONFIG)}'
+        )
+        proc = QProcess(self)
+        proc.setProcessChannelMode(QProcess.MergedChannels)
+        proc.readyReadStandardOutput.connect(lambda: self._on_sensor_proc_output(proc))
+        proc.finished.connect(
+            lambda code, status: self._on_camera_ros_finished(proc, code, status)
+        )
+        proc.start('setsid', ['--wait', 'bash', '-c', cmd])
+        if not proc.waitForStarted(5000):
+            self._log_err('RealSense ROS2/RViz2 启动失败')
+            self._sensor_log_err('RealSense ROS2/RViz2 启动失败')
+            self._set_camera_buttons_enabled(True)
+        else:
+            self._proc_camera_ros = proc
+            self._log_ok(f'RealSense ROS2/RViz2 已启动 (PID: {proc.processId()})')
+            self._sensor_log(f'RealSense ROS2/RViz2 已启动 (PID: {proc.processId()})')
+
+    def _on_camera_ros_finished(self, proc: QProcess, code, status):
+        if self._proc_camera_ros is proc:
+            self._proc_camera_ros = None
+        if code == 0:
+            self._log('RealSense ROS2/RViz2 已退出')
+            self._sensor_log('RealSense ROS2/RViz2 已退出')
+        else:
+            self._log_err(f'RealSense ROS2/RViz2 退出 (code={code})')
+            self._sensor_log_err(f'RealSense ROS2/RViz2 退出 (code={code})')
+        self._set_camera_buttons_enabled(True)
+
+    def _on_start_camera_viewer(self):
+        if self._deployment_blocks_action('启动 RealSense Viewer'):
+            return
+        if self._camera_process_running():
+            self._log('已有 RealSense 查看器在运行；请先关闭其窗口')
+            return
+        viewer = _find_realsense_viewer()
+        if not viewer or not os.path.isfile(viewer):
+            self._log_err('RealSense Viewer 未找到；请确认已安装并在 PATH 或当前 ROS 环境中')
+            return
+
+        self._log('=' * 50)
+        self._log('启动 RealSense 相机查看器...')
+        self._sensor_log('启动 RealSense 相机查看器...')
+        self._set_camera_buttons_enabled(False)
+
+        proc = QProcess(self)
+        proc.setProcessChannelMode(QProcess.MergedChannels)
+        proc.readyReadStandardOutput.connect(lambda: self._on_sensor_proc_output(proc))
+        proc.finished.connect(lambda code, status: self._on_camera_finished(code, status))
+
+        proc.start(viewer)
+        if not proc.waitForStarted(5000):
+            self._log_err('RealSense Viewer 启动失败')
+            self._sensor_log_err('RealSense Viewer 启动失败')
+            self._set_camera_buttons_enabled(True)
+        else:
+            self._log_ok('RealSense Viewer 已启动')
+            self._sensor_log('RealSense Viewer 已启动')
+            self._proc_camera = proc
+
+    def _on_camera_finished(self, code, status):
+        if code == 0:
+            self._log('RealSense Viewer 已退出')
+            self._sensor_log('RealSense Viewer 已退出')
+        else:
+            self._log_err(f'RealSense Viewer 退出 (code={code})')
+            self._sensor_log_err(f'RealSense Viewer 退出 (code={code})')
+        self._set_camera_buttons_enabled(True)
+        self._proc_camera = None
+
+    def _on_start_lidar_viewer(self):
+        if self._deployment_blocks_action('启动 Livox 查看器'):
+            return
+        if self._proc_lidar and self._proc_lidar.state() != QProcess.NotRunning:
+            self._log('Livox 激光雷达查看器已在运行中')
+            return
+
+        self._log('=' * 50)
+        self._log('启动 Livox Mid-360S 激光雷达查看器...')
+        self._sensor_log('启动 Livox Mid-360S 激光雷达查看器...')
+        self.btn_lidar.setEnabled(False)
+        self.btn_lidar_stop.setEnabled(True)
+
+        cmd = (
+            f'source {_SETUP_BASH} && '
+            'ros2 launch livox_ros_driver2 rviz_MID360_launch.py'
+        )
+
+        proc = QProcess(self)
+        proc.setProcessChannelMode(QProcess.MergedChannels)
+        proc.readyReadStandardOutput.connect(lambda: self._on_sensor_proc_output(proc))
+        proc.finished.connect(lambda code, status: self._on_lidar_finished(code, status))
+
+        proc.start('setsid', ['--wait', 'bash', '-c', cmd])
+        if not proc.waitForStarted(5000):
+            self._log_err('Livox 激光雷达查看器启动失败')
+            self._sensor_log_err('Livox 激光雷达查看器启动失败')
+            self.btn_lidar.setEnabled(True)
+            self.btn_lidar_stop.setEnabled(False)
+        else:
+            self._log_ok(f'Livox 激光雷达查看器已启动 (PID: {proc.processId()})')
+            self._sensor_log(f'Livox 激光雷达查看器已启动 (PID: {proc.processId()})')
+            self._proc_lidar = proc
+
+    def _on_stop_lidar_viewer(self):
+        if self._proc_lidar is None or self._proc_lidar.state() == QProcess.NotRunning:
+            self._log('Livox 激光雷达查看器未在运行')
+            return
+
+        self._log('正在停止 Livox 激光雷达查看器...')
+        # 向整个进程组发 SIGINT（让 ros2 launch 优雅退出）
+        pid = self._proc_lidar.processId()
+        if pid:
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGINT)
+            except (ProcessLookupError, PermissionError):
+                self._proc_lidar.terminate()
+        else:
+            self._proc_lidar.terminate()
+
+        # 如果 8 秒内没退出就强制结束整个进程组
+        QTimer.singleShot(FORCE_STOP_TIMEOUT_MS, lambda: self._force_kill_lidar())
+
+    def _force_kill_lidar(self):
+        if self._proc_lidar and self._proc_lidar.state() != QProcess.NotRunning:
+            self._log('Livox 激光雷达查看器未响应 SIGINT，强制终止')
+            pid = self._proc_lidar.processId()
+            if pid:
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                    return
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            self._proc_lidar.kill()
+
+    def _on_lidar_finished(self, code, status):
+        if code == 0:
+            self._log('Livox 激光雷达查看器已退出')
+            self._sensor_log('Livox 激光雷达查看器已退出')
+        else:
+            self._log_err(f'Livox 激光雷达查看器退出 (code={code})')
+            self._sensor_log_err(f'Livox 激光雷达查看器退出 (code={code})')
+        self.btn_lidar.setEnabled(True)
+        self.btn_lidar_stop.setEnabled(False)
+        self._proc_lidar = None
+
+    # ── QProcess 辅助 ────────────────────────────────────────────
+    def _launch_process(self, cmd: str, dot: StatusDot, btn_start: QPushButton,
+                        btn_stop: QPushButton, label: str) -> QProcess:
+        proc = QProcess(self)
+        proc.setProcessChannelMode(QProcess.MergedChannels)
+
+        proc.readyReadStandardOutput.connect(
+            lambda: self._on_proc_output(proc)
+        )
+        proc.finished.connect(
+            lambda code, status: self._on_proc_finished(code, status, dot, btn_start, btn_stop, label)
+        )
+
+        dot.set_state('running')
+        btn_start.setEnabled(False)
+        btn_stop.setEnabled(True)
+
+        proc.start('setsid', ['--wait', 'bash', '-c', cmd])
+        if not proc.waitForStarted(5000):
+            self._log_err(f'{label} 启动失败')
+            dot.set_state('error')
+            btn_start.setEnabled(True)
+            btn_stop.setEnabled(False)
+        else:
+            self._log_ok(f'{label} 已启动 (PID: {proc.processId()})')
+        return proc
+
+    def _on_proc_output(self, proc: QProcess):
+        data = proc.readAllStandardOutput().data()
+        try:
+            text = data.decode('utf-8', errors='replace').rstrip()
+        except Exception:
+            text = str(data)
+        if text:
+            self._append_log(text)
+
+    def _on_sensor_proc_output(self, proc: QProcess):
+        data = proc.readAllStandardOutput().data()
+        try:
+            text = data.decode('utf-8', errors='replace').rstrip()
+        except Exception:
+            text = str(data)
+        if text:
+            self._append_sensor_log(text)
+
+    def _append_sensor_log(self, text: str):
+        self.sensor_log_view.append(text)
+        self.sensor_log_view.moveCursor(QTextCursor.End)
+
+    def _sensor_log(self, msg: str):
+        self._append_sensor_log(msg)
+
+    def _sensor_log_err(self, msg: str):
+        self._append_sensor_log(f'<span style="color:#e74c3c">{msg}</span>')
+
+    def _on_proc_finished(self, code, status, dot, btn_start, btn_stop, label):
+        if label == '整机控制':
+            self._auto_start_vr_pending = False
+            self._stop_battery_monitor()
+            if self._combined_bringup_owned:
+                self._combined_bringup_owned = False
+                if self._combined_vr_owned:
+                    self._combined_stop_pending = True
+                    self._log_err('整机控制已退出，正在停止组合启动的 VR 遥操作')
+                    self._stop_process(
+                        self._proc_vr, self.dot_vr, self.btn_vr_start,
+                        self.btn_vr_stop, '组合启动的 VR 遥操作'
+                    )
+                elif self._combined_start_active:
+                    self._finish_combined_workflow()
+        elif label == 'VR 遥操作' and self._combined_vr_owned:
+            self._combined_vr_owned = False
+            if self._combined_stop_pending:
+                self._stop_owned_combined_bringup()
+        elif label == '图传':
+            self._set_video_source_buttons_enabled(True)
+            self._proc_video = None
+        if code == 0:
+            self._log(f'{label} 已正常退出')
+            dot.set_state('idle')
+        else:
+            self._log_err(f'{label} 退出 (code={code})')
+            dot.set_state('error')
+        btn_start.setEnabled(True)
+        btn_stop.setEnabled(False)
+        self._update_motor_page_lock()
+
+    def _stop_process(self, proc: QProcess | None, dot: StatusDot,
+                      btn_start: QPushButton, btn_stop: QPushButton, label: str):
+        if proc is None or proc.state() == QProcess.NotRunning:
+            self._log(f'{label} 未在运行')
+            return
+        self._log(f'正在停止 {label}...')
+        # 向整个进程组发 SIGINT（让 ros2 launch 优雅退出）
+        pid = proc.processId()
+        if pid:
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGINT)
+            except (ProcessLookupError, PermissionError):
+                proc.terminate()
+        else:
+            proc.terminate()
+
+        # 如果 8 秒内没退出就强制结束整个进程组
+        QTimer.singleShot(FORCE_STOP_TIMEOUT_MS, lambda: self._force_kill(proc, label))
+
+    def _force_kill(self, proc: QProcess, label: str):
+        if proc.state() != QProcess.NotRunning:
+            self._log(f'{label} 未响应 SIGINT，强制终止')
+            pid = proc.processId()
+            if pid:
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                    return
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            proc.kill()
+
+    # ── 窗口关闭 ─────────────────────────────────────────────────
+    def closeEvent(self, event):
+        if self.deployment_runner and self.deployment_runner.is_running:
+            self.deployment_runner.cancel()
+            if hasattr(self.deployment_runner, 'wait_for_finished'):
+                self.deployment_runner.wait_for_finished()
+        # 关窗前先同步失能底盘（controller_manager 还活着）
+        if self._proc_bringup and self._proc_bringup.state() != QProcess.NotRunning:
+            cmd = (
+                f'source {_SETUP_BASH} && '
+                'ros2 control set_controller_state swerve_drive_controller inactive && '
+                'ros2 control set_hardware_component_state swerve_drive_system inactive'
+            )
+            try:
+                subprocess.run(['bash', '-c', cmd], timeout=8,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
+        processes = [
+            self._proc_battery,
+            self._proc_bringup,
+            self._proc_vr,
+            self._proc_video,
+            self._proc_lidar,
+        ]
+        for proc in processes:
+            if proc and proc.state() != QProcess.NotRunning:
+                pid = proc.processId()
+                if pid:
+                    try:
+                        os.killpg(os.getpgid(pid), signal.SIGINT)
+                    except Exception:
+                        proc.kill()
+                else:
+                    proc.kill()
+                if not proc.waitForFinished(FORCE_STOP_TIMEOUT_MS):
+                    self._force_kill(proc, '窗口关闭')
+
+        for proc, process_group in (
+            (self._proc_camera_ros, True),
+            (self._proc_camera, False),
+        ):
+            if proc and proc.state() != QProcess.NotRunning:
+                self._terminate_camera_process(proc, process_group)
+                if not proc.waitForFinished(FORCE_STOP_TIMEOUT_MS):
+                    self._force_stop_camera_process(proc, process_group)
+        if self.motor_manager_adapter is not None:
+            self.motor_manager_adapter.shutdown()
+        event.accept()
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == '__main__':
+    main()
